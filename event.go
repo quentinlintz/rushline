@@ -29,7 +29,7 @@ type Event struct {
 
 	id       string
 	capacity int
-	holds    []Hold
+	holds    map[string]Hold
 
 	onsaleOpening      time.Time
 	holdCreationCutoff time.Time
@@ -56,6 +56,7 @@ func newEvent(id string, capacity int, onsaleOpening, holdCreationCutoff, confir
 	newEvent := &Event{
 		id:                 id,
 		capacity:           capacity,
+		holds:              make(map[string]Hold),
 		onsaleOpening:      onsaleOpening,
 		holdCreationCutoff: holdCreationCutoff,
 		confirmationCutoff: confirmationCutoff,
@@ -93,7 +94,8 @@ func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdD
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if e.getHoldByIDLocked(id).status != HoldStatusInvalid {
+	_, ok := e.getHoldByIDLocked(id)
+	if ok {
 		return Hold{}, errors.New("id is duplicate")
 	}
 
@@ -107,9 +109,45 @@ func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdD
 		quantity: quantity,
 		deadline: confirmationDeadline,
 	}
-	e.holds = append(e.holds, newHold)
+	e.holds[newHold.id] = newHold
 
 	return newHold, nil
+}
+
+func (e *Event) confirmHold(id string, currentTime time.Time) (Hold, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.confirmHoldLocked(id, currentTime)
+}
+
+func (e *Event) confirmHoldLocked(id string, currentTime time.Time) (Hold, error) {
+	hold, ok := e.getHoldByIDLocked(id)
+
+	if !ok {
+		return Hold{}, errors.New("hold not found")
+	}
+
+	switch hold.status {
+	case HoldStatusInvalid:
+		return Hold{}, errors.New("cannot confirm hold of status 'invalid'")
+	case HoldStatusActive:
+		if currentTime.After(hold.deadline) || currentTime.Equal(hold.deadline) {
+			hold.status = HoldStatusExpired
+			e.holds[id] = hold
+			return Hold{}, errors.New("can only transition hold before confirmation deadline")
+		}
+		hold.status = HoldStatusConfirmed
+		e.holds[id] = hold
+		return e.holds[id], nil
+	case HoldStatusConfirmed:
+		return Hold{}, errors.New("hold is already confirmed")
+	case HoldStatusCancelled:
+		return Hold{}, errors.New("cannot confirm hold of status 'cancelled'")
+	case HoldStatusExpired:
+		return Hold{}, errors.New("cannot confirm hold of status 'expired'")
+	default:
+		return Hold{}, errors.New("hold has unknown status")
+	}
 }
 
 func (e *Event) getAvailabilityLocked() int {
@@ -132,11 +170,13 @@ func (e *Event) getTotalHoldsByStatusLocked(status HoldStatus) int {
 	return total
 }
 
-func (e *Event) getHoldByIDLocked(id string) Hold {
-	for _, hold := range e.holds {
-		if hold.id == id {
-			return hold
-		}
-	}
-	return Hold{}
+func (e *Event) getHoldByIDLocked(id string) (Hold, bool) {
+	hold, ok := e.holds[id]
+	return hold, ok
+}
+
+func (e *Event) getHoldByID(id string) (Hold, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.getHoldByIDLocked(id)
 }
