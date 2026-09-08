@@ -30,7 +30,7 @@ func setupHold(t *testing.T, event *Event, now time.Time) Hold {
 }
 
 func TestNewEvent(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1781622600, 0)
 
 	tests := []struct {
 		name               string
@@ -62,7 +62,7 @@ func TestNewEvent(t *testing.T) {
 }
 
 func TestCreateHold(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1781622600, 0)
 
 	t.Run("creates valid hold", func(t *testing.T) {
 		event := setupEvent(t, now)
@@ -133,7 +133,6 @@ func TestCreateHold(t *testing.T) {
 	}
 
 	t.Run("creation exactly at onsaleOpening succeeds", func(t *testing.T) {
-		now := time.Now()
 		event, eventErr := newEvent("1", 1, now, now.Add(time.Minute), now.Add(time.Hour))
 		if eventErr != nil {
 			t.Fatalf("tried creating a valid event, but got: '%v'", eventErr.Error())
@@ -145,7 +144,6 @@ func TestCreateHold(t *testing.T) {
 	})
 
 	t.Run("hold duration beyond confirmationCutoff clamps at cutoff", func(t *testing.T) {
-		now := time.Now()
 		confirmationCutoff := now.Add(time.Hour)
 		event, eventErr := newEvent("1", 1, now, now.Add(time.Minute), confirmationCutoff)
 		if eventErr != nil {
@@ -162,7 +160,6 @@ func TestCreateHold(t *testing.T) {
 
 	t.Run("handles data race for holding over capacity", func(t *testing.T) {
 		holdResult := make(chan createHoldResult)
-		now := time.Now()
 		event, eventErr := newEvent("1", 1, now, now.Add(time.Minute), now.Add(time.Hour))
 		if eventErr != nil {
 			t.Fatalf("tried creating a valid event, but got: '%v'", eventErr.Error())
@@ -212,14 +209,14 @@ func TestCreateHold(t *testing.T) {
 }
 
 func TestConfirmHold(t *testing.T) {
-	now := time.Now()
+	now := time.Unix(1781622600, 0)
 
 	t.Run("confirms valid hold", func(t *testing.T) {
 		id := "1"
 		event := setupEvent(t, now)
-		setupHold(t, event, now)
+		hold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
-		returnedHold, err := event.confirmHold(id, now)
+		confirmedHold, err := event.confirmHold(id, now)
 		if err != nil {
 			t.Fatalf("confirmHold returned error: '%v'", err)
 		}
@@ -232,25 +229,36 @@ func TestConfirmHold(t *testing.T) {
 		if availabilityStart != availabilityEnd {
 			t.Errorf("expected availability to not change, got start %v and end %v available", availabilityStart, availabilityEnd)
 		}
-		if storedHold != returnedHold {
-			t.Errorf("expected returned hold to equal stored hold, got stored '%v' and returned '%v'", storedHold, returnedHold)
+		if storedHold != confirmedHold {
+			t.Errorf("expected returned hold to equal stored hold, got stored '%v' and returned '%v'", storedHold, confirmedHold)
+		}
+		if hold.id != confirmedHold.id {
+			t.Errorf("expected hold id to not have changed, got original '%v' and returned '%v'", hold.id, confirmedHold.id)
+		}
+		if hold.quantity != confirmedHold.quantity {
+			t.Errorf("expected hold quantity to not have changed, got original '%v' and returned '%v'", hold.quantity, confirmedHold.quantity)
+		}
+		if hold.deadline != confirmedHold.deadline {
+			t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, confirmedHold.deadline)
 		}
 	})
 
 	tests := []struct {
-		name        string
-		id          string
-		status      HoldStatus
-		currentTime time.Time
-		wantErr     string
+		name            string
+		id              string
+		status          HoldStatus
+		endStatus       HoldStatus
+		endAvailability int
+		currentTime     time.Time
+		wantErr         string
 	}{
-		{"has unknown status", "1", 123, now, "hold has unknown status"},
-		{"has invalid status", "1", HoldStatusInvalid, now, "cannot confirm hold of status 'invalid'"},
-		{"has cancelled status", "1", HoldStatusCancelled, now, "cannot confirm hold of status 'cancelled'"},
-		{"has expired status", "1", HoldStatusExpired, now, "cannot confirm hold of status 'expired'"},
-		{"has confirmed after deadline", "1", HoldStatusActive, now.Add(2 * time.Hour), "can only transition hold before confirmation deadline"},
-		{"has confirmed on deadline", "1", HoldStatusActive, now.Add(time.Minute), "can only transition hold before confirmation deadline"},
-		{"has already confirmed", "1", HoldStatusConfirmed, now, "hold is already confirmed"},
+		{"has unknown status", "1", 123, 123, 5, now, "hold has unknown status"},
+		{"has invalid status", "1", HoldStatusInvalid, HoldStatusInvalid, 5, now, "cannot confirm hold of status 'invalid'"},
+		{"has cancelled status", "1", HoldStatusCancelled, HoldStatusCancelled, 5, now, "cannot confirm hold of status 'cancelled'"},
+		{"has expired status", "1", HoldStatusExpired, HoldStatusExpired, 5, now, "cannot confirm hold of status 'expired'"},
+		{"hold confirmed after deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(2 * time.Hour), "can only transition hold before confirmation deadline"},
+		{"has confirmed on deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(time.Minute), "can only transition hold before confirmation deadline"},
+		{"has already confirmed", "1", HoldStatusConfirmed, HoldStatusConfirmed, 4, now, "hold is already confirmed"},
 	}
 
 	for _, tt := range tests {
@@ -259,7 +267,6 @@ func TestConfirmHold(t *testing.T) {
 			hold := setupHold(t, event, now)
 			hold.status = tt.status
 			event.holds[tt.id] = hold
-			availabilityStart := event.getAvailability()
 			_, err := event.confirmHold(tt.id, tt.currentTime)
 			storedHold, found := event.getHoldByID(tt.id)
 			availabilityEnd := event.getAvailability()
@@ -272,20 +279,20 @@ func TestConfirmHold(t *testing.T) {
 			if err != nil && err.Error() != tt.wantErr {
 				t.Errorf("confirmHold error: '%v'; want '%v'", err.Error(), tt.wantErr)
 			}
-			if tt.name == "has confirmed after deadline" || tt.name == "has confirmed on deadline" {
-				if storedHold.status != HoldStatusExpired {
-					t.Errorf("expected hold after/on deadline to expire, but got status '%v'", storedHold.status)
-				}
-				if availabilityStart != availabilityEnd-hold.quantity {
-					t.Errorf("expected expired hold quantity to be released, got start %v and end %v available", availabilityStart, availabilityEnd)
-				}
-			} else {
-				if storedHold.status != hold.status {
-					t.Errorf("expected status to remain unchanged when confirmation failed, but got status '%v'", storedHold.status)
-				}
-				if availabilityStart != availabilityEnd {
-					t.Errorf("expected availability to not change, got start %v and end %v available", availabilityStart, availabilityEnd)
-				}
+			if storedHold.status != tt.endStatus {
+				t.Errorf("expected status to change to '%v', but got '%v'", tt.endStatus, storedHold.status)
+			}
+			if availabilityEnd != tt.endAvailability {
+				t.Errorf("expected availability to be %v, but got %v", tt.endAvailability, availabilityEnd)
+			}
+			if hold.id != storedHold.id {
+				t.Errorf("expected hold id to not have changed, got original '%v' and returned '%v'", hold.id, storedHold.id)
+			}
+			if hold.quantity != storedHold.quantity {
+				t.Errorf("expected hold quantity to not have changed, got original '%v' and returned '%v'", hold.quantity, storedHold.quantity)
+			}
+			if hold.deadline != storedHold.deadline {
+				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, storedHold.deadline)
 			}
 		})
 	}
@@ -293,6 +300,108 @@ func TestConfirmHold(t *testing.T) {
 	t.Run("hold not found", func(t *testing.T) {
 		event := setupEvent(t, now)
 		_, got := event.confirmHold("1", now)
+		wantErr := "hold not found"
+		if got == nil {
+			t.Errorf("Wanted error: '%v'", wantErr)
+		}
+		if got != nil && got.Error() != wantErr {
+			t.Errorf("expected error '%v', but received: '%v'", wantErr, got)
+		}
+	})
+}
+
+func TestCancelHold(t *testing.T) {
+	now := time.Unix(1781622600, 0)
+
+	t.Run("cancels valid hold", func(t *testing.T) {
+		id := "1"
+		event := setupEvent(t, now)
+		hold := setupHold(t, event, now)
+		availabilityStart := event.getAvailability()
+		cancelledHold, err := event.cancelHold(id, now)
+		if err != nil {
+			t.Fatalf("cancelHold returned error: '%v'", err)
+		}
+
+		availabilityEnd := event.getAvailability()
+		storedHold, _ := event.getHoldByID(id)
+		if storedHold.status != HoldStatusCancelled {
+			t.Errorf("expected cancelled hold, got status: '%v'", storedHold.status)
+		}
+		if availabilityStart != availabilityEnd-hold.quantity {
+			t.Errorf("expected availability to increase by hold quantity, got start %v and end %v available", availabilityStart, availabilityEnd)
+		}
+		if storedHold != cancelledHold {
+			t.Errorf("expected returned hold to equal stored hold, got stored '%v' and returned '%v'", storedHold, cancelledHold)
+		}
+		if hold.id != cancelledHold.id {
+			t.Errorf("expected hold id to not have changed, got original '%v' and returned '%v'", hold.id, cancelledHold.id)
+		}
+		if hold.quantity != cancelledHold.quantity {
+			t.Errorf("expected hold quantity to not have changed, got original '%v' and returned '%v'", hold.quantity, cancelledHold.quantity)
+		}
+		if hold.deadline != cancelledHold.deadline {
+			t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, cancelledHold.deadline)
+		}
+	})
+
+	tests := []struct {
+		name            string
+		id              string
+		status          HoldStatus
+		endStatus       HoldStatus
+		endAvailability int
+		currentTime     time.Time
+		wantErr         string
+	}{
+		{"has unknown status", "1", 123, 123, 5, now, "hold has unknown status"},
+		{"has invalid status", "1", HoldStatusInvalid, HoldStatusInvalid, 5, now, "cannot cancel hold of status 'invalid'"},
+		{"has confirmed status", "1", HoldStatusConfirmed, HoldStatusConfirmed, 4, now, "cannot cancel hold of status 'confirmed'"},
+		{"has expired status", "1", HoldStatusExpired, HoldStatusExpired, 5, now, "cannot cancel hold of status 'expired'"},
+		{"has cancelled after deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(2 * time.Hour), "can only transition hold before confirmation deadline"},
+		{"has cancelled on deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(time.Minute), "can only transition hold before confirmation deadline"},
+		{"has already cancelled", "1", HoldStatusCancelled, HoldStatusCancelled, 5, now, "hold is already cancelled"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := setupEvent(t, now)
+			hold := setupHold(t, event, now)
+			hold.status = tt.status
+			event.holds[tt.id] = hold
+			_, err := event.cancelHold(tt.id, tt.currentTime)
+			storedHold, found := event.getHoldByID(tt.id)
+			availabilityEnd := event.getAvailability()
+			if !found {
+				t.Fatal("hold not found after cancelHold")
+			}
+			if err == nil {
+				t.Errorf("cancelHold wanted error: '%v'", tt.wantErr)
+			}
+			if err != nil && err.Error() != tt.wantErr {
+				t.Errorf("cancelHold error: '%v'; want '%v'", err.Error(), tt.wantErr)
+			}
+			if storedHold.status != tt.endStatus {
+				t.Errorf("expected status to change to '%v', but got '%v'", tt.endStatus, storedHold.status)
+			}
+			if availabilityEnd != tt.endAvailability {
+				t.Errorf("expected availability to be %v, but got %v", tt.endAvailability, availabilityEnd)
+			}
+			if hold.id != storedHold.id {
+				t.Errorf("expected hold id to not have changed, got original '%v' and returned '%v'", hold.id, storedHold.id)
+			}
+			if hold.quantity != storedHold.quantity {
+				t.Errorf("expected hold quantity to not have changed, got original '%v' and returned '%v'", hold.quantity, storedHold.quantity)
+			}
+			if hold.deadline != storedHold.deadline {
+				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, storedHold.deadline)
+			}
+		})
+	}
+
+	t.Run("hold not found", func(t *testing.T) {
+		event := setupEvent(t, now)
+		_, got := event.cancelHold("1", now)
 		wantErr := "hold not found"
 		if got == nil {
 			t.Errorf("Wanted error: '%v'", wantErr)

@@ -150,6 +150,42 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time) (Hold, error
 	}
 }
 
+func (e *Event) cancelHold(id string, currentTime time.Time) (Hold, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.cancelHoldLocked(id, currentTime)
+}
+
+func (e *Event) cancelHoldLocked(id string, currentTime time.Time) (Hold, error) {
+	hold, ok := e.getHoldByIDLocked(id)
+
+	if !ok {
+		return Hold{}, errors.New("hold not found")
+	}
+
+	switch hold.status {
+	case HoldStatusInvalid:
+		return Hold{}, errors.New("cannot cancel hold of status 'invalid'")
+	case HoldStatusActive:
+		if currentTime.After(hold.deadline) || currentTime.Equal(hold.deadline) {
+			hold.status = HoldStatusExpired
+			e.holds[id] = hold
+			return Hold{}, errors.New("can only transition hold before confirmation deadline")
+		}
+		hold.status = HoldStatusCancelled
+		e.holds[id] = hold
+		return e.holds[id], nil
+	case HoldStatusConfirmed:
+		return Hold{}, errors.New("cannot cancel hold of status 'confirmed'")
+	case HoldStatusCancelled:
+		return Hold{}, errors.New("hold is already cancelled")
+	case HoldStatusExpired:
+		return Hold{}, errors.New("cannot cancel hold of status 'expired'")
+	default:
+		return Hold{}, errors.New("hold has unknown status")
+	}
+}
+
 func (e *Event) getAvailabilityLocked() int {
 	return e.capacity - e.getTotalHoldsByStatusLocked(HoldStatusActive) - e.getTotalHoldsByStatusLocked(HoldStatusConfirmed)
 }
