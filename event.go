@@ -2,6 +2,7 @@ package rushline
 
 import (
 	"errors"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,8 @@ type Hold struct {
 }
 
 type Event struct {
+	mu sync.Mutex
+
 	id       string
 	capacity int
 	holds    []Hold
@@ -70,16 +73,8 @@ func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdD
 		return Hold{}, errors.New("id is required")
 	}
 
-	if e.getHoldByID(id).status != HoldStatusInvalid {
-		return Hold{}, errors.New("id is duplicate")
-	}
-
 	if quantity <= 0 {
 		return Hold{}, errors.New("must request positive quantity")
-	}
-
-	if quantity > e.getAvailability() {
-		return Hold{}, errors.New("cannot over-sell")
 	}
 
 	if e.holdCreationCutoff.Before(currentTime) || e.holdCreationCutoff.Equal(currentTime) {
@@ -95,6 +90,17 @@ func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdD
 		confirmationDeadline = e.confirmationCutoff
 	}
 
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.getHoldByIDLocked(id).status != HoldStatusInvalid {
+		return Hold{}, errors.New("id is duplicate")
+	}
+
+	if quantity > e.getAvailabilityLocked() {
+		return Hold{}, errors.New("cannot over-sell")
+	}
+
 	newHold := Hold{
 		id:       id,
 		status:   HoldStatusActive,
@@ -106,11 +112,17 @@ func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdD
 	return newHold, nil
 }
 
-func (e Event) getAvailability() int {
-	return e.capacity - e.getTotalHoldsByStatus(HoldStatusActive) - e.getTotalHoldsByStatus(HoldStatusConfirmed)
+func (e *Event) getAvailabilityLocked() int {
+	return e.capacity - e.getTotalHoldsByStatusLocked(HoldStatusActive) - e.getTotalHoldsByStatusLocked(HoldStatusConfirmed)
 }
 
-func (e Event) getTotalHoldsByStatus(status HoldStatus) int {
+func (e *Event) getAvailability() int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.getAvailabilityLocked()
+}
+
+func (e *Event) getTotalHoldsByStatusLocked(status HoldStatus) int {
 	total := 0
 	for _, hold := range e.holds {
 		if hold.status == status {
@@ -120,7 +132,7 @@ func (e Event) getTotalHoldsByStatus(status HoldStatus) int {
 	return total
 }
 
-func (e Event) getHoldByID(id string) Hold {
+func (e *Event) getHoldByIDLocked(id string) Hold {
 	for _, hold := range e.holds {
 		if hold.id == id {
 			return hold

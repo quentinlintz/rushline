@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+type createHoldResult struct {
+	hold Hold
+	err  error
+}
+
 func setupEvent(t *testing.T, now time.Time) *Event {
 	t.Helper()
 	event, err := newEvent("1", 5, now, now.Add(time.Hour), now.Add(time.Hour+time.Minute))
@@ -152,6 +157,56 @@ func TestCreateHold(t *testing.T) {
 		}
 		if hold.deadline != confirmationCutoff {
 			t.Error("expected hold deadline to clamp at confirmation cutoff when hold deadline is longer")
+		}
+	})
+
+	t.Run("handles data race for holding over capacity", func(t *testing.T) {
+		holdResult := make(chan createHoldResult)
+		now := time.Now()
+		event, eventErr := newEvent("1", 1, now, now.Add(time.Minute), now.Add(time.Hour))
+		if eventErr != nil {
+			t.Fatalf("tried creating a valid event, but got: '%v'", eventErr.Error())
+		}
+		go func() {
+			hold, err := event.createHold("1", 1, now, 2*time.Hour)
+			holdResult <- createHoldResult{hold, err}
+		}()
+		go func() {
+			hold, err := event.createHold("2", 1, now, 2*time.Hour)
+			holdResult <- createHoldResult{hold, err}
+		}()
+
+		errorCount := 0
+		successCount := 0
+		for range 2 {
+			result := <-holdResult
+			if result.err == nil {
+				if result.hold.id != "1" && result.hold.id != "2" {
+					t.Error("expected hold ids to match '1' or '2'")
+				}
+				successCount++
+				continue
+			}
+			if result.err.Error() != "cannot over-sell" {
+				t.Errorf("expected error 'cannot over-sell', but received: %v", result.err.Error())
+			}
+			errorCount++
+		}
+
+		if successCount != 1 {
+			t.Errorf("expected 1 success creating a hold, but received: %v", successCount)
+		}
+		if errorCount != 1 {
+			t.Errorf("expected 1 error creating a hold, but received: %v", errorCount)
+		}
+
+		availability := event.getAvailability()
+		holdLen := len(event.holds)
+		if availability != 0 {
+			t.Errorf("expected 0 available holds, but got %v", availability)
+		}
+		if holdLen != 1 {
+			t.Errorf("expected 1 count holds, but got %v", holdLen)
 		}
 	})
 }
