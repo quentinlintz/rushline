@@ -411,3 +411,113 @@ func TestCancelHold(t *testing.T) {
 		}
 	})
 }
+
+func TestExpireHold(t *testing.T) {
+	now := time.Unix(1781622600, 0)
+
+	validTests := []struct {
+		name        string
+		currentTime time.Time
+	}{
+		{"expires valid hold on deadline", now.Add(time.Minute)},
+		{"expires valid hold after deadline", now.Add(2 * time.Minute)},
+	}
+	for _, tt := range validTests {
+		t.Run(tt.name, func(t *testing.T) {
+			id := "1"
+			event := setupEvent(t, now)
+			hold := setupHold(t, event, now)
+			availabilityStart := event.getAvailability()
+			expiredHold, err := event.expireHold(id, tt.currentTime)
+			if err != nil {
+				t.Fatalf("expireHold returned error: '%v'", err)
+			}
+
+			availabilityEnd := event.getAvailability()
+			storedHold, _ := event.getHoldByID(id)
+			if storedHold.status != HoldStatusExpired {
+				t.Errorf("expected expired hold, got status: '%v'", storedHold.status)
+			}
+			if availabilityStart != availabilityEnd-hold.quantity {
+				t.Errorf("expected availability to increase by hold quantity, got start %v and end %v available", availabilityStart, availabilityEnd)
+			}
+			if storedHold != expiredHold {
+				t.Errorf("expected returned hold to equal stored hold, got stored '%v' and returned '%v'", storedHold, expiredHold)
+			}
+			if hold.id != expiredHold.id {
+				t.Errorf("expected hold id to not have changed, got original '%v' and returned '%v'", hold.id, expiredHold.id)
+			}
+			if hold.quantity != expiredHold.quantity {
+				t.Errorf("expected hold quantity to not have changed, got original '%v' and returned '%v'", hold.quantity, expiredHold.quantity)
+			}
+			if hold.deadline != expiredHold.deadline {
+				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, expiredHold.deadline)
+			}
+		})
+	}
+
+	tests := []struct {
+		name            string
+		id              string
+		status          HoldStatus
+		endStatus       HoldStatus
+		endAvailability int
+		currentTime     time.Time
+		wantErr         string
+	}{
+		{"has unknown status", "1", 123, 123, 5, now, "hold has unknown status"},
+		{"has invalid status", "1", HoldStatusInvalid, HoldStatusInvalid, 5, now, "cannot expire hold of status 'invalid'"},
+		{"has confirmed status", "1", HoldStatusConfirmed, HoldStatusConfirmed, 4, now, "cannot expire hold of status 'confirmed'"},
+		{"has expired status", "1", HoldStatusExpired, HoldStatusExpired, 5, now, "hold is already expired"},
+		{"has already cancelled", "1", HoldStatusCancelled, HoldStatusCancelled, 5, now, "cannot expire hold of status 'cancelled'"},
+		{"before the deadline", "1", HoldStatusActive, HoldStatusActive, 4, now.Add(time.Second), "can only expire holds at or after the deadline"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := setupEvent(t, now)
+			hold := setupHold(t, event, now)
+			hold.status = tt.status
+			event.holds[tt.id] = hold
+			_, err := event.expireHold(tt.id, tt.currentTime)
+			storedHold, found := event.getHoldByID(tt.id)
+			availabilityEnd := event.getAvailability()
+			if !found {
+				t.Fatal("hold not found after expireHold")
+			}
+			if err == nil {
+				t.Errorf("expireHold wanted error: '%v'", tt.wantErr)
+			}
+			if err != nil && err.Error() != tt.wantErr {
+				t.Errorf("expireHold error: '%v'; want '%v'", err.Error(), tt.wantErr)
+			}
+			if storedHold.status != tt.endStatus {
+				t.Errorf("expected status to change to '%v', but got '%v'", tt.endStatus, storedHold.status)
+			}
+			if availabilityEnd != tt.endAvailability {
+				t.Errorf("expected availability to be %v, but got %v", tt.endAvailability, availabilityEnd)
+			}
+			if hold.id != storedHold.id {
+				t.Errorf("expected hold id to not have changed, got original '%v' and returned '%v'", hold.id, storedHold.id)
+			}
+			if hold.quantity != storedHold.quantity {
+				t.Errorf("expected hold quantity to not have changed, got original '%v' and returned '%v'", hold.quantity, storedHold.quantity)
+			}
+			if hold.deadline != storedHold.deadline {
+				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, storedHold.deadline)
+			}
+		})
+	}
+
+	t.Run("hold not found", func(t *testing.T) {
+		event := setupEvent(t, now)
+		_, got := event.expireHold("1", now)
+		wantErr := "hold not found"
+		if got == nil {
+			t.Errorf("Wanted error: '%v'", wantErr)
+		}
+		if got != nil && got.Error() != wantErr {
+			t.Errorf("expected error '%v', but received: '%v'", wantErr, got)
+		}
+	})
+}
