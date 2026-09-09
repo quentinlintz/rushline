@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-type createHoldResult struct {
+type holdResult struct {
 	hold Hold
 	err  error
 }
@@ -159,24 +159,24 @@ func TestCreateHold(t *testing.T) {
 	})
 
 	t.Run("handles data race for holding over capacity", func(t *testing.T) {
-		holdResult := make(chan createHoldResult)
+		holdChan := make(chan holdResult)
 		event, eventErr := newEvent("1", 1, now, now.Add(time.Minute), now.Add(time.Hour))
 		if eventErr != nil {
 			t.Fatalf("tried creating a valid event, but got: '%v'", eventErr.Error())
 		}
 		go func() {
 			hold, err := event.createHold("1", 1, now, 2*time.Hour)
-			holdResult <- createHoldResult{hold, err}
+			holdChan <- holdResult{hold, err}
 		}()
 		go func() {
 			hold, err := event.createHold("2", 1, now, 2*time.Hour)
-			holdResult <- createHoldResult{hold, err}
+			holdChan <- holdResult{hold, err}
 		}()
 
 		errorCount := 0
 		successCount := 0
 		for range 2 {
-			result := <-holdResult
+			result := <-holdChan
 			if result.err == nil {
 				if result.hold.id != "1" && result.hold.id != "2" {
 					t.Error("expected hold ids to match '1' or '2'")
@@ -191,10 +191,10 @@ func TestCreateHold(t *testing.T) {
 		}
 
 		if successCount != 1 {
-			t.Errorf("expected 1 success creating a hold, but received: %v", successCount)
+			t.Fatalf("expected 1 success creating a hold, but received: %v", successCount)
 		}
 		if errorCount != 1 {
-			t.Errorf("expected 1 error creating a hold, but received: %v", errorCount)
+			t.Fatalf("expected 1 error creating a hold, but received: %v", errorCount)
 		}
 
 		availability := event.getAvailability()
@@ -518,6 +518,92 @@ func TestExpireHold(t *testing.T) {
 		}
 		if got != nil && got.Error() != wantErr {
 			t.Errorf("expected error '%v', but received: '%v'", wantErr, got)
+		}
+	})
+}
+
+func TestConfirmCancelHoldConcurrent(t *testing.T) {
+	now := time.Unix(1781622600, 0)
+
+	t.Run("handles data race for confirming and cancelling the same active hold", func(t *testing.T) {
+		holdChan := make(chan holdResult)
+		event := setupEvent(t, now)
+		hold := setupHold(t, event, now)
+		availabilityStart := event.getAvailability()
+
+		go func() {
+			hold, err := event.cancelHold("1", now)
+			holdChan <- holdResult{hold, err}
+		}()
+		go func() {
+			hold, err := event.confirmHold("1", now)
+			holdChan <- holdResult{hold, err}
+		}()
+
+		successfulHold := Hold{}
+		var failedError error
+		successCount := 0
+		errorCount := 0
+		for range 2 {
+			result := <-holdChan
+			if result.err == nil {
+				successfulHold = result.hold
+				successCount++
+				continue
+			}
+			if result.err.Error() != "cannot cancel hold of status 'confirmed'" && result.err.Error() != "cannot confirm hold of status 'cancelled'" {
+				t.Errorf("expected cannot cancel/confirm error, but received: '%v'", result.err.Error())
+			}
+			failedError = result.err
+			errorCount++
+		}
+
+		if successCount != 1 {
+			t.Fatalf("expected 1 success transitioning a hold, but received: %v", successCount)
+		}
+		if errorCount != 1 {
+			t.Fatalf("expected 1 error transitioning a hold, but received: %v", errorCount)
+		}
+
+		availabilityEnd := event.getAvailability()
+		holdLen := len(event.holds)
+		storedHold, exists := event.getHoldByID("1")
+		if !exists {
+			t.Fatal("expected hold to be found")
+		}
+		if storedHold != successfulHold {
+			t.Error("successful hold does not equal the stored hold")
+		}
+		if hold.id != storedHold.id {
+			t.Errorf("expected hold id to be %v, but got %v", hold.id, storedHold.id)
+		}
+		if hold.deadline != storedHold.deadline {
+			t.Errorf("expected hold deadline to be %v, but got %v", hold.deadline, storedHold.deadline)
+		}
+		if hold.quantity != storedHold.quantity {
+			t.Errorf("expected hold quantity to be %v, but got %v", hold.quantity, storedHold.quantity)
+		}
+
+		switch storedHold.status {
+		case HoldStatusConfirmed:
+			if availabilityStart != availabilityEnd {
+				t.Errorf("expected %v available holds, but got %v", availabilityStart, availabilityEnd)
+			}
+			if failedError.Error() != "cannot cancel hold of status 'confirmed'" {
+				t.Errorf("expected error: cannot cancel hold of status 'confirmed', but got %v", failedError.Error())
+			}
+		case HoldStatusCancelled:
+			if availabilityStart+hold.quantity != availabilityEnd {
+				t.Errorf("expected %v available holds, but got %v", availabilityStart+hold.quantity, availabilityEnd)
+			}
+			if failedError.Error() != "cannot confirm hold of status 'cancelled'" {
+				t.Errorf("expected error: cannot confirm hold of status 'cancelled', but got %v", failedError.Error())
+			}
+		default:
+			t.Errorf("stored hold has invalid status: '%v'", storedHold.status)
+		}
+		if holdLen != 1 {
+			t.Errorf("expected 1 count holds, but got %v", holdLen)
 		}
 	})
 }
