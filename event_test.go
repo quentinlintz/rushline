@@ -2,6 +2,7 @@ package rushline
 
 import (
 	"math"
+	"slices"
 	"testing"
 	"time"
 )
@@ -604,6 +605,83 @@ func TestConfirmCancelHoldConcurrent(t *testing.T) {
 		}
 		if holdLen != 1 {
 			t.Errorf("expected 1 count holds, but got %v", holdLen)
+		}
+	})
+}
+
+func TestConfirmExpireHoldConcurrent(t *testing.T) {
+	now := time.Unix(1781622600, 0)
+
+	t.Run("handles data race for confirming and expiring the same active hold", func(t *testing.T) {
+		holdChan := make(chan holdResult)
+		event := setupEvent(t, now)
+		hold := setupHold(t, event, now)
+		availabilityStart := event.getAvailability()
+
+		go func() {
+			hold, err := event.confirmHold("1", hold.deadline)
+			holdChan <- holdResult{hold, err}
+		}()
+		go func() {
+			hold, err := event.expireHold("1", hold.deadline)
+			holdChan <- holdResult{hold, err}
+		}()
+
+		successfulHold := hold
+		errorSlice := make([]string, 0, 2)
+		successCount := 0
+		for range 2 {
+			result := <-holdChan
+			if result.err == nil {
+				successfulHold = result.hold
+				successCount++
+				continue
+			}
+			errorSlice = append(errorSlice, result.err.Error())
+		}
+
+		availabilityEnd := event.getAvailability()
+		storedHold, exists := event.getHoldByID("1")
+		if !exists {
+			t.Fatal("expected hold to be found")
+		}
+		switch len(errorSlice) {
+		// Expiration first
+		case 1:
+			if !slices.Contains(errorSlice, "cannot confirm hold of status 'expired'") {
+				t.Error("expected error: cannot confirm hold of status 'expired'")
+			}
+			if successCount != 1 {
+				t.Errorf("expected 1 success, but got %v", successCount)
+			}
+			if storedHold != successfulHold {
+				t.Error("successful hold does not equal the stored hold")
+			}
+		// Confirmation first
+		case 2:
+			if !slices.Contains(errorSlice, "can only transition hold before confirmation deadline") {
+				t.Error("expected error: can only transition hold before confirmation deadline")
+			}
+			if !slices.Contains(errorSlice, "hold is already expired") {
+				t.Error("expected error: hold is already expired")
+			}
+		default:
+			t.Fatalf("expected 1 or 2 errors, but got %v", len(errorSlice))
+		}
+		if hold.id != storedHold.id {
+			t.Errorf("expected hold id to be %v, but got %v", hold.id, storedHold.id)
+		}
+		if hold.deadline != storedHold.deadline {
+			t.Errorf("expected hold deadline to be %v, but got %v", hold.deadline, storedHold.deadline)
+		}
+		if hold.quantity != storedHold.quantity {
+			t.Errorf("expected hold quantity to be %v, but got %v", hold.quantity, storedHold.quantity)
+		}
+		if storedHold.status != HoldStatusExpired {
+			t.Errorf("expected status to be '4', but got '%v'", storedHold.status)
+		}
+		if availabilityStart != availabilityEnd-hold.quantity {
+			t.Errorf("expected availability to increase by hold quantity, got start %v and end %v available", availabilityStart, availabilityEnd)
 		}
 	})
 }
