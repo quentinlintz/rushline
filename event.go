@@ -220,6 +220,20 @@ func (e *Event) expireHoldLocked(id string, currentTime time.Time) (Hold, error)
 	}
 }
 
+func (e *Event) scanForExpiredHolds(currentTime time.Time) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for id, hold := range e.holds {
+		if hold.status == HoldStatusActive && (currentTime.After(hold.deadline) || currentTime.Equal(hold.deadline)) {
+			_, err := e.expireHoldLocked(id, currentTime)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 func (e *Event) getAvailabilityLocked() int {
 	return e.capacity - e.getTotalHoldsByStatusLocked(HoldStatusActive) - e.getTotalHoldsByStatusLocked(HoldStatusConfirmed)
 }
