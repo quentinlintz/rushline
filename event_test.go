@@ -3,6 +3,7 @@ package rushline
 import (
 	"math"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -14,11 +15,11 @@ type holdResult struct {
 
 var now = time.Unix(1781622600, 0)
 
-func setupEvent(t *testing.T, now time.Time) *Event {
-	t.Helper()
-	event, err := newEvent("1", 5, now, now.Add(time.Hour), now.Add(time.Hour+time.Minute))
+func setupEvent(tb testing.TB, now time.Time, capacity int) *Event {
+	tb.Helper()
+	event, err := newEvent("1", capacity, now, now.Add(time.Hour), now.Add(time.Hour+time.Minute))
 	if err != nil {
-		t.Fatalf("tried creating a valid event, but got: '%v'", err.Error())
+		tb.Fatalf("tried creating a valid event, but got: '%v'", err.Error())
 	}
 	return event
 }
@@ -64,7 +65,7 @@ func TestNewEvent(t *testing.T) {
 
 func TestCreateHold(t *testing.T) {
 	t.Run("creates valid hold", func(t *testing.T) {
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 		hold := setupHold(t, event, now)
 		availability := event.getAvailability()
 		if hold.id != "1" {
@@ -107,7 +108,7 @@ func TestCreateHold(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			event := setupEvent(t, now)
+			event := setupEvent(t, now, 5)
 			if tt.needsExistingHold {
 				setupHold(t, event, now)
 			}
@@ -210,7 +211,7 @@ func TestCreateHold(t *testing.T) {
 func TestConfirmHold(t *testing.T) {
 	t.Run("confirms valid hold", func(t *testing.T) {
 		id := "1"
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 		hold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
 		confirmedHold, err := event.confirmHold(id, now)
@@ -260,7 +261,7 @@ func TestConfirmHold(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			event := setupEvent(t, now)
+			event := setupEvent(t, now, 5)
 			hold := setupHold(t, event, now)
 			hold.status = tt.status
 			event.holds[tt.id] = hold
@@ -295,7 +296,7 @@ func TestConfirmHold(t *testing.T) {
 	}
 
 	t.Run("hold not found", func(t *testing.T) {
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 		_, got := event.confirmHold("1", now)
 		wantErr := "hold not found"
 		if got == nil {
@@ -310,7 +311,7 @@ func TestConfirmHold(t *testing.T) {
 func TestCancelHold(t *testing.T) {
 	t.Run("cancels valid hold", func(t *testing.T) {
 		id := "1"
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 		hold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
 		cancelledHold, err := event.cancelHold(id, now)
@@ -360,7 +361,7 @@ func TestCancelHold(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			event := setupEvent(t, now)
+			event := setupEvent(t, now, 5)
 			hold := setupHold(t, event, now)
 			hold.status = tt.status
 			event.holds[tt.id] = hold
@@ -395,7 +396,7 @@ func TestCancelHold(t *testing.T) {
 	}
 
 	t.Run("hold not found", func(t *testing.T) {
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 		_, got := event.cancelHold("1", now)
 		wantErr := "hold not found"
 		if got == nil {
@@ -418,7 +419,7 @@ func TestExpireHold(t *testing.T) {
 	for _, tt := range validTests {
 		t.Run(tt.name, func(t *testing.T) {
 			id := "1"
-			event := setupEvent(t, now)
+			event := setupEvent(t, now, 5)
 			hold := setupHold(t, event, now)
 			availabilityStart := event.getAvailability()
 			expiredHold, err := event.expireHold(id, tt.currentTime)
@@ -468,7 +469,7 @@ func TestExpireHold(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			event := setupEvent(t, now)
+			event := setupEvent(t, now, 5)
 			hold := setupHold(t, event, now)
 			hold.status = tt.status
 			event.holds[tt.id] = hold
@@ -503,7 +504,7 @@ func TestExpireHold(t *testing.T) {
 	}
 
 	t.Run("hold not found", func(t *testing.T) {
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 		_, got := event.expireHold("1", now)
 		wantErr := "hold not found"
 		if got == nil {
@@ -518,7 +519,7 @@ func TestExpireHold(t *testing.T) {
 func TestConfirmCancelHoldConcurrent(t *testing.T) {
 	t.Run("handles data race for confirming and cancelling the same active hold", func(t *testing.T) {
 		holdChan := make(chan holdResult)
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 		hold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
 
@@ -601,7 +602,7 @@ func TestConfirmCancelHoldConcurrent(t *testing.T) {
 
 func TestConfirmExpireHoldConcurrent(t *testing.T) {
 	holdChan := make(chan holdResult)
-	event := setupEvent(t, now)
+	event := setupEvent(t, now, 5)
 	hold := setupHold(t, event, now)
 	availabilityStart := event.getAvailability()
 
@@ -689,10 +690,7 @@ func TestScanForExpireHolds(t *testing.T) {
 			{"6", 1, now.Add(time.Minute), time.Minute, HoldStatusActive},
 		}
 
-		event, err := newEvent("1", 9, now, now.Add(time.Hour), now.Add(time.Hour+time.Minute))
-		if err != nil {
-			t.Fatalf("tried creating a valid event, but got: '%v'", err.Error())
-		}
+		event := setupEvent(t, now, 9)
 		originalHolds := make(map[string]Hold)
 		for _, hold := range holds {
 			originalHold, err := event.createHold(hold.id, hold.quantity, hold.currentTime, hold.holdDuration)
@@ -711,7 +709,7 @@ func TestScanForExpireHolds(t *testing.T) {
 			}
 		}
 
-		_, err = event.cancelHold("2", now.Add(time.Minute))
+		_, err := event.cancelHold("2", now.Add(time.Minute))
 		if err != nil {
 			t.Fatalf("cancelling hold failed: %v", err.Error())
 		}
@@ -755,7 +753,7 @@ func TestScanForExpireHolds(t *testing.T) {
 	})
 
 	t.Run("empty event", func(t *testing.T) {
-		event := setupEvent(t, now)
+		event := setupEvent(t, now, 5)
 
 		if event.getAvailability() != 5 {
 			t.Fatalf("starting availability of an empty event should be 5, but got: %v", event.getAvailability())
@@ -856,4 +854,61 @@ func TestScanForExpireHolds(t *testing.T) {
 			}
 		}
 	})
+}
+
+func BenchmarkScanForExpireHolds(b *testing.B) {
+	tests := []struct {
+		name       string
+		totalHolds int
+		dueHolds   int
+	}{
+		{"1_000 holds, 10 due", 1_000, 10},
+		{"10_000 holds, 10 due", 10_000, 10},
+		{"100_000 holds, 10 due", 100_000, 10},
+	}
+
+	for _, tt := range tests {
+		b.Run(tt.name, func(b *testing.B) {
+			expiredHoldStartIdx := tt.totalHolds - tt.dueHolds
+			event := setupEvent(b, now, tt.totalHolds)
+			for i := range tt.totalHolds {
+				var err error
+				if i < expiredHoldStartIdx {
+					_, err = event.createHold(strconv.Itoa(i), 1, now, time.Minute)
+				} else {
+					_, err = event.createHold(strconv.Itoa(i), 1, now, time.Second)
+				}
+				if err != nil {
+					b.Fatalf("failed to create hold with id %v", strconv.Itoa(i))
+				}
+			}
+
+			for b.Loop() {
+				err := event.scanForExpiredHolds(now.Add(time.Second))
+				b.StopTimer()
+				if err != nil {
+					b.Fatalf("failure from scan: %v", err.Error())
+				}
+				for i := range tt.totalHolds {
+					idx := strconv.Itoa(i)
+					hold, exists := event.getHoldByID(idx)
+					if !exists {
+						b.Fatalf("expected hold with id %v to exist", idx)
+					}
+					if i < expiredHoldStartIdx {
+						if hold.status != HoldStatusActive {
+							b.Errorf("expected hold with id %v to be active, but got '%v'", hold.id, hold.status)
+						}
+					} else {
+						if hold.status != HoldStatusExpired {
+							b.Errorf("expected hold with id %v to be expired, but got '%v'", hold.id, hold.status)
+						}
+						hold.status = HoldStatusActive
+						event.holds[idx] = hold
+					}
+				}
+				b.StartTimer()
+			}
+		})
+	}
 }
