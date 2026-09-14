@@ -2,6 +2,8 @@ package rushline
 
 import (
 	"errors"
+	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -27,9 +29,10 @@ type Hold struct {
 type Event struct {
 	mu sync.Mutex
 
-	id       string
-	capacity int
-	holds    map[string]Hold
+	id             string
+	capacity       int
+	holds          map[string]Hold
+	expirableHolds []string // Active holds ordered by deadline
 
 	onsaleOpening      time.Time
 	holdCreationCutoff time.Time
@@ -110,6 +113,11 @@ func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdD
 		deadline: confirmationDeadline,
 	}
 	e.holds[newHold.id] = newHold
+	err := e.insertExpirableHoldLocked(newHold)
+	if err != nil {
+		delete(e.holds, newHold.id)
+		return Hold{}, err
+	}
 
 	return newHold, nil
 }
@@ -132,9 +140,17 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time) (Hold, error
 		return Hold{}, errors.New("cannot confirm hold of status 'invalid'")
 	case HoldStatusActive:
 		if currentTime.After(hold.deadline) || currentTime.Equal(hold.deadline) {
+			err := e.removeExpirableHoldLocked(id)
+			if err != nil {
+				return Hold{}, err
+			}
 			hold.status = HoldStatusExpired
 			e.holds[id] = hold
 			return Hold{}, errors.New("can only transition hold before confirmation deadline")
+		}
+		err := e.removeExpirableHoldLocked(id)
+		if err != nil {
+			return Hold{}, err
 		}
 		hold.status = HoldStatusConfirmed
 		e.holds[id] = hold
@@ -168,9 +184,17 @@ func (e *Event) cancelHoldLocked(id string, currentTime time.Time) (Hold, error)
 		return Hold{}, errors.New("cannot cancel hold of status 'invalid'")
 	case HoldStatusActive:
 		if currentTime.After(hold.deadline) || currentTime.Equal(hold.deadline) {
+			err := e.removeExpirableHoldLocked(id)
+			if err != nil {
+				return Hold{}, err
+			}
 			hold.status = HoldStatusExpired
 			e.holds[id] = hold
 			return Hold{}, errors.New("can only transition hold before confirmation deadline")
+		}
+		err := e.removeExpirableHoldLocked(id)
+		if err != nil {
+			return Hold{}, err
 		}
 		hold.status = HoldStatusCancelled
 		e.holds[id] = hold
@@ -205,6 +229,10 @@ func (e *Event) expireHoldLocked(id string, currentTime time.Time) (Hold, error)
 	case HoldStatusActive:
 		if currentTime.Before(hold.deadline) {
 			return Hold{}, errors.New("can only expire holds at or after the deadline")
+		}
+		err := e.removeExpirableHoldLocked(id)
+		if err != nil {
+			return Hold{}, err
 		}
 		hold.status = HoldStatusExpired
 		e.holds[id] = hold
@@ -254,13 +282,59 @@ func (e *Event) getTotalHoldsByStatusLocked(status HoldStatus) int {
 	return total
 }
 
+func (e *Event) getHoldByID(id string) (Hold, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.getHoldByIDLocked(id)
+}
+
 func (e *Event) getHoldByIDLocked(id string) (Hold, bool) {
 	hold, ok := e.holds[id]
 	return hold, ok
 }
 
-func (e *Event) getHoldByID(id string) (Hold, bool) {
+func (e *Event) insertExpirableHold(hold Hold) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.getHoldByIDLocked(id)
+	return e.insertExpirableHoldLocked(hold)
+}
+
+func (e *Event) insertExpirableHoldLocked(hold Hold) error {
+	expHoldLength := len(e.expirableHolds)
+	storedHold, exists := e.getHoldByIDLocked(hold.id)
+	if !exists {
+		return fmt.Errorf("hold not found when inserting into expirableHolds")
+	}
+	if slices.Contains(e.expirableHolds, hold.id) {
+		return fmt.Errorf("hold with id '%v' already exists in expirableHolds", hold.id)
+	}
+
+	for i := range expHoldLength {
+		storedHold, exists = e.getHoldByIDLocked(e.expirableHolds[i])
+		if !exists {
+			return fmt.Errorf("hold with id '%v' not found when inserting into expirableHolds", e.expirableHolds[i])
+		}
+		if storedHold.deadline.After(hold.deadline) {
+			e.expirableHolds = slices.Insert(e.expirableHolds, i, hold.id)
+			return nil
+		}
+	}
+	e.expirableHolds = append(e.expirableHolds, hold.id)
+	return nil
+}
+
+func (e *Event) removeExpirableHold(id string) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.removeExpirableHoldLocked(id)
+}
+
+func (e *Event) removeExpirableHoldLocked(id string) error {
+	for i := range len(e.expirableHolds) {
+		if id == e.expirableHolds[i] {
+			e.expirableHolds = slices.Delete(e.expirableHolds, i, i+1)
+			return nil
+		}
+	}
+	return fmt.Errorf("hold id '%v' not found when removing from expirableHolds", id)
 }

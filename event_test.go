@@ -33,6 +33,41 @@ func setupHold(t *testing.T, event *Event, now time.Time) Hold {
 	return hold
 }
 
+func countOccurrences[T comparable](slice []T, target T) int {
+	count := 0
+	for _, v := range slice {
+		if v == target {
+			count++
+		}
+	}
+	return count
+}
+
+func assertExpirableHoldMembership(t *testing.T, e *Event) {
+	t.Helper()
+	for id := range e.holds {
+		occurrences := countOccurrences(e.expirableHolds, id)
+		if e.holds[id].status == HoldStatusActive {
+			if occurrences == 0 {
+				t.Errorf("expected hold with id '%v' to be in expirableHolds exactly once, but not found", id)
+			}
+			if occurrences > 1 {
+				t.Errorf("expected hold with id '%v' to be in expirableHolds exactly once, but contained %v", id, occurrences)
+			}
+		} else {
+			if occurrences != 0 {
+				t.Errorf("expected hold with id '%v' to not be found in expirableHolds, but contained %v", id, occurrences)
+			}
+		}
+	}
+	for _, id := range e.expirableHolds {
+		_, exists := e.getHoldByID(id)
+		if !exists {
+			t.Errorf("expected expirableHold entry with id '%v' to be in holds map", id)
+		}
+	}
+}
+
 func TestNewEvent(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -83,6 +118,7 @@ func TestCreateHold(t *testing.T) {
 		if availability != event.capacity-hold.quantity {
 			t.Errorf("expected availability == %v, but got: %v", event.capacity-hold.quantity, availability)
 		}
+		assertExpirableHoldMembership(t, event)
 	})
 
 	tests := []struct {
@@ -114,6 +150,7 @@ func TestCreateHold(t *testing.T) {
 			}
 			availabilityStart := event.getAvailability()
 			holdLenStart := len(event.holds)
+			expirableHoldsStart := slices.Clone(event.expirableHolds)
 			_, got := event.createHold(tt.id, tt.quantity, tt.currentTime, tt.holdDuration)
 			if got == nil {
 				t.Errorf("createHold wanted error: '%v'", tt.wantErr)
@@ -123,11 +160,15 @@ func TestCreateHold(t *testing.T) {
 			}
 			availabilityEnd := event.getAvailability()
 			holdLenEnd := len(event.holds)
+			expirableHoldsEnd := event.expirableHolds
 			if availabilityStart != availabilityEnd {
 				t.Errorf("availability started at %v but ended at %v", availabilityStart, availabilityEnd)
 			}
 			if holdLenStart != holdLenEnd {
 				t.Errorf("hold count started at %v but ended at %v", holdLenStart, holdLenEnd)
+			}
+			if !slices.Equal(expirableHoldsStart, expirableHoldsEnd) {
+				t.Errorf("expected expirableHolds to remain unchanged, but got: %+v", expirableHoldsEnd)
 			}
 		})
 	}
@@ -206,6 +247,31 @@ func TestCreateHold(t *testing.T) {
 			t.Errorf("expected 1 count holds, but got %v", holdLen)
 		}
 	})
+
+	t.Run("expirableHolds rollback", func(t *testing.T) {
+		expected := "hold with id '1' not found when inserting into expirableHolds"
+		event := setupEvent(t, now, 2)
+		event.expirableHolds = append(event.expirableHolds, "1")
+		availabilityStart := event.getAvailability()
+		_, err := event.createHold("2", 1, now, time.Minute)
+		_, exists := event.getHoldByID("2")
+		availabilityEnd := event.getAvailability()
+		if err == nil {
+			t.Fatal("expected error for missing id in expirableHolds")
+		}
+		if err.Error() != expected {
+			t.Errorf("expected error '%v', but got '%v'", expected, err.Error())
+		}
+		if availabilityStart != availabilityEnd {
+			t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+		}
+		if exists {
+			t.Error("expected hold with id '2' not to be in holds map")
+		}
+		if !slices.Equal(event.expirableHolds, []string{"1"}) {
+			t.Errorf("expected expirableHolds to have '1', but it has %+v", event.expirableHolds)
+		}
+	})
 }
 
 func TestConfirmHold(t *testing.T) {
@@ -239,6 +305,7 @@ func TestConfirmHold(t *testing.T) {
 		if hold.deadline != confirmedHold.deadline {
 			t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, confirmedHold.deadline)
 		}
+		assertExpirableHoldMembership(t, event)
 	})
 
 	tests := []struct {
@@ -264,7 +331,14 @@ func TestConfirmHold(t *testing.T) {
 			event := setupEvent(t, now, 5)
 			hold := setupHold(t, event, now)
 			hold.status = tt.status
+			if tt.status != HoldStatusActive {
+				err := event.removeExpirableHold(tt.id)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			event.holds[tt.id] = hold
+			assertExpirableHoldMembership(t, event)
 			_, err := event.confirmHold(tt.id, tt.currentTime)
 			storedHold, found := event.getHoldByID(tt.id)
 			availabilityEnd := event.getAvailability()
@@ -292,6 +366,7 @@ func TestConfirmHold(t *testing.T) {
 			if hold.deadline != storedHold.deadline {
 				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, storedHold.deadline)
 			}
+			assertExpirableHoldMembership(t, event)
 		})
 	}
 
@@ -306,6 +381,42 @@ func TestConfirmHold(t *testing.T) {
 			t.Errorf("expected error '%v', but received: '%v'", wantErr, got)
 		}
 	})
+
+	expirableTests := []struct {
+		name             string
+		confirmationTime time.Time
+	}{
+		{"missing in expirableHolds before deadline", now.Add(time.Second)},
+		{"missing in expirableHolds on deadline", now.Add(time.Minute)},
+	}
+
+	for _, tt := range expirableTests {
+		t.Run(tt.name, func(t *testing.T) {
+			expected := "hold id '1' not found when removing from expirableHolds"
+			event := setupEvent(t, now, 2)
+			holdBefore := setupHold(t, event, now)
+			event.expirableHolds = []string{}
+			availabilityStart := event.getAvailability()
+			_, err := event.confirmHold(holdBefore.id, tt.confirmationTime)
+			holdAfter, _ := event.getHoldByID("1")
+			availabilityEnd := event.getAvailability()
+			if err == nil {
+				t.Fatal("expected error when removing missing hold from expirableHolds")
+			}
+			if err.Error() != expected {
+				t.Errorf("expected error to be '%v', but it was '%v'", expected, err.Error())
+			}
+			if availabilityStart != availabilityEnd {
+				t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+			}
+			if len(event.expirableHolds) != 0 {
+				t.Errorf("expected expirableHolds to be empty, but it was %v", len(event.expirableHolds))
+			}
+			if holdBefore != holdAfter {
+				t.Errorf("expected hold to be %+v, but it was %+v", holdBefore, holdAfter)
+			}
+		})
+	}
 }
 
 func TestCancelHold(t *testing.T) {
@@ -314,6 +425,7 @@ func TestCancelHold(t *testing.T) {
 		event := setupEvent(t, now, 5)
 		hold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
+		assertExpirableHoldMembership(t, event)
 		cancelledHold, err := event.cancelHold(id, now)
 		if err != nil {
 			t.Fatalf("cancelHold returned error: '%v'", err)
@@ -339,6 +451,7 @@ func TestCancelHold(t *testing.T) {
 		if hold.deadline != cancelledHold.deadline {
 			t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, cancelledHold.deadline)
 		}
+		assertExpirableHoldMembership(t, event)
 	})
 
 	tests := []struct {
@@ -364,7 +477,14 @@ func TestCancelHold(t *testing.T) {
 			event := setupEvent(t, now, 5)
 			hold := setupHold(t, event, now)
 			hold.status = tt.status
+			if tt.status != HoldStatusActive {
+				err := event.removeExpirableHold(tt.id)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			event.holds[tt.id] = hold
+			assertExpirableHoldMembership(t, event)
 			_, err := event.cancelHold(tt.id, tt.currentTime)
 			storedHold, found := event.getHoldByID(tt.id)
 			availabilityEnd := event.getAvailability()
@@ -392,6 +512,7 @@ func TestCancelHold(t *testing.T) {
 			if hold.deadline != storedHold.deadline {
 				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, storedHold.deadline)
 			}
+			assertExpirableHoldMembership(t, event)
 		})
 	}
 
@@ -406,6 +527,42 @@ func TestCancelHold(t *testing.T) {
 			t.Errorf("expected error '%v', but received: '%v'", wantErr, got)
 		}
 	})
+
+	expirableTests := []struct {
+		name             string
+		cancellationTime time.Time
+	}{
+		{"missing in expirableHolds before deadline", now.Add(time.Second)},
+		{"missing in expirableHolds on deadline", now.Add(time.Minute)},
+	}
+
+	for _, tt := range expirableTests {
+		t.Run(tt.name, func(t *testing.T) {
+			expected := "hold id '1' not found when removing from expirableHolds"
+			event := setupEvent(t, now, 2)
+			holdBefore := setupHold(t, event, now)
+			event.expirableHolds = []string{}
+			availabilityStart := event.getAvailability()
+			_, err := event.cancelHold(holdBefore.id, tt.cancellationTime)
+			holdAfter, _ := event.getHoldByID("1")
+			availabilityEnd := event.getAvailability()
+			if err == nil {
+				t.Fatal("expected error when removing missing hold from expirableHolds")
+			}
+			if err.Error() != expected {
+				t.Errorf("expected error to be '%v', but it was '%v'", expected, err.Error())
+			}
+			if availabilityStart != availabilityEnd {
+				t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+			}
+			if len(event.expirableHolds) != 0 {
+				t.Errorf("expected expirableHolds to be empty, but it was %v", len(event.expirableHolds))
+			}
+			if holdBefore != holdAfter {
+				t.Errorf("expected hold to be %+v, but it was %+v", holdBefore, holdAfter)
+			}
+		})
+	}
 }
 
 func TestExpireHold(t *testing.T) {
@@ -447,6 +604,9 @@ func TestExpireHold(t *testing.T) {
 			if hold.deadline != expiredHold.deadline {
 				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, expiredHold.deadline)
 			}
+			if len(event.expirableHolds) != 0 {
+				t.Errorf("expected expired hold with id '%v' to have been removed from expirableHolds", hold.id)
+			}
 		})
 	}
 
@@ -472,7 +632,14 @@ func TestExpireHold(t *testing.T) {
 			event := setupEvent(t, now, 5)
 			hold := setupHold(t, event, now)
 			hold.status = tt.status
+			if tt.status != HoldStatusActive {
+				err := event.removeExpirableHold(tt.id)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
 			event.holds[tt.id] = hold
+			assertExpirableHoldMembership(t, event)
 			_, err := event.expireHold(tt.id, tt.currentTime)
 			storedHold, found := event.getHoldByID(tt.id)
 			availabilityEnd := event.getAvailability()
@@ -500,6 +667,7 @@ func TestExpireHold(t *testing.T) {
 			if hold.deadline != storedHold.deadline {
 				t.Errorf("expected hold deadline to not have changed, got original '%v' and returned '%v'", hold.deadline, storedHold.deadline)
 			}
+			assertExpirableHoldMembership(t, event)
 		})
 	}
 
@@ -512,6 +680,32 @@ func TestExpireHold(t *testing.T) {
 		}
 		if got != nil && got.Error() != wantErr {
 			t.Errorf("expected error '%v', but received: '%v'", wantErr, got)
+		}
+	})
+
+	t.Run("missing in expirableHolds on deadline", func(t *testing.T) {
+		expected := "hold id '1' not found when removing from expirableHolds"
+		event := setupEvent(t, now, 2)
+		holdBefore := setupHold(t, event, now)
+		event.expirableHolds = []string{}
+		availabilityStart := event.getAvailability()
+		_, err := event.expireHold(holdBefore.id, now.Add(time.Minute))
+		holdAfter, _ := event.getHoldByID("1")
+		availabilityEnd := event.getAvailability()
+		if err == nil {
+			t.Fatal("expected error when removing missing hold from expirableHolds")
+		}
+		if err.Error() != expected {
+			t.Errorf("expected error to be '%v', but it was '%v'", expected, err.Error())
+		}
+		if availabilityStart != availabilityEnd {
+			t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+		}
+		if len(event.expirableHolds) != 0 {
+			t.Errorf("expected expirableHolds to be empty, but it was %v", len(event.expirableHolds))
+		}
+		if holdBefore != holdAfter {
+			t.Errorf("expected hold to be %+v, but it was %+v", holdBefore, holdAfter)
 		}
 	})
 }
@@ -911,4 +1105,146 @@ func BenchmarkScanForExpireHolds(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestInsertExpirableHold(t *testing.T) {
+	tests := []struct {
+		name     string
+		deadline []time.Time
+		expected []string
+	}{
+		{"inserts before", []time.Time{now.Add(2 * time.Minute), now.Add(time.Minute), now}, []string{"3", "2", "1"}},
+		{"inserts between", []time.Time{now, now.Add(time.Minute), now.Add(time.Second)}, []string{"1", "3", "2"}},
+		{"inserts after", []time.Time{now, now.Add(time.Minute), now.Add(2 * time.Minute)}, []string{"1", "2", "3"}},
+		{"inserts equal deadline", []time.Time{now, now, now}, []string{"1", "2", "3"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := setupEvent(t, now, 3)
+			for i := range 3 {
+				id := strconv.Itoa(i + 1)
+				event.holds[id] = Hold{id: id, status: HoldStatusActive, quantity: 1, deadline: tt.deadline[i]}
+				err := event.insertExpirableHold(event.holds[id])
+				if err != nil {
+					t.Fatalf("failed to insert hold with id '%v' into expirableHolds: %v", id, err.Error())
+				}
+			}
+			if !slices.Equal(event.expirableHolds, tt.expected) {
+				t.Errorf("expected ids in order '%+v', but got '%+v'", tt.expected, event.expirableHolds)
+			}
+		})
+	}
+
+	t.Run("missing hold id", func(t *testing.T) {
+		expected := "hold not found when inserting into expirableHolds"
+		event := setupEvent(t, now, 1)
+		hold := Hold{id: "1", status: HoldStatusActive, quantity: 1, deadline: now.Add(time.Minute)}
+		err := event.insertExpirableHold(hold)
+		if err == nil {
+			t.Fatalf("expected missing hold id error")
+		}
+		if err.Error() != expected {
+			t.Errorf("expected error '%v', but received '%v'", expected, err.Error())
+		}
+		if len(event.expirableHolds) != 0 {
+			t.Errorf("expected expirableHolds to be empty, but it has %+v", event.expirableHolds)
+		}
+	})
+
+	t.Run("insert duplicate id", func(t *testing.T) {
+		expected := "hold with id '1' already exists in expirableHolds"
+		event := setupEvent(t, now, 1)
+		event.holds["1"] = Hold{id: "1", status: HoldStatusActive, quantity: 1, deadline: now}
+		availabilityStart := event.getAvailability()
+		err := event.insertExpirableHold(event.holds["1"])
+		if err != nil {
+			t.Fatalf("failed to insert hold with id '1' into expirableHolds: %v", err.Error())
+		}
+		err = event.insertExpirableHold(event.holds["1"])
+		availabilityEnd := event.getAvailability()
+		if err == nil {
+			t.Fatal("expected error when inserting duplicate id into expirableHolds")
+		}
+		if err.Error() != expected {
+			t.Errorf("expected error '%v' when inserting duplicate into expirableHolds, but got '%v'", expected, err.Error())
+		}
+		if !slices.Equal(event.expirableHolds, []string{"1"}) {
+			t.Errorf("expected expirableHolds to be unchanged, but got %+v", event.expirableHolds)
+		}
+		if availabilityStart != availabilityEnd {
+			t.Errorf("expected availability to be %v, but got %v", availabilityStart, availabilityEnd)
+		}
+	})
+
+	t.Run("hold not found in map", func(t *testing.T) {
+		expected := "hold with id '1' not found when inserting into expirableHolds"
+		event := setupEvent(t, now, 2)
+		hold := Hold{id: "2", status: HoldStatusActive, quantity: 1, deadline: now.Add(time.Minute)}
+		event.holds["2"] = hold
+		event.expirableHolds = append(event.expirableHolds, "1")
+		availabilityStart := event.getAvailability()
+		err := event.insertExpirableHold(hold)
+		availabilityEnd := event.getAvailability()
+		if err == nil {
+			t.Fatal("expected error but got none")
+		}
+		if err.Error() != expected {
+			t.Errorf("expected error '%v', but got '%v'", expected, err.Error())
+		}
+		if !slices.Equal(event.expirableHolds, []string{"1"}) {
+			t.Errorf("expected expirableHolds to remain unchanged, but it was '%+v'", event.expirableHolds)
+		}
+		if availabilityStart != availabilityEnd {
+			t.Errorf("expected availability to be %v, but got %v", availabilityStart, availabilityEnd)
+		}
+	})
+}
+
+func TestRemoveExpirableHold(t *testing.T) {
+	tests := []struct {
+		name     string
+		id       string
+		expected []string
+	}{
+		{"remove first", "1", []string{"2", "3"}},
+		{"remove last", "3", []string{"1", "2"}},
+		{"remove middle", "2", []string{"1", "3"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := setupEvent(t, now, 3)
+			for i := range 3 {
+				id := strconv.Itoa(i + 1)
+				event.holds[id] = Hold{id: id, status: HoldStatusActive, quantity: 1, deadline: now}
+				event.expirableHolds = append(event.expirableHolds, id)
+			}
+			err := event.removeExpirableHold(tt.id)
+			if err != nil {
+				t.Fatalf("failed to remove hold with id '%v' from expirableHolds: %v", tt.id, err.Error())
+			}
+			if !slices.Equal(event.expirableHolds, tt.expected) {
+				t.Errorf("expected ids in order '%+v', but got '%+v'", tt.expected, event.expirableHolds)
+			}
+		})
+	}
+
+	t.Run("hold id not found", func(t *testing.T) {
+		expected := "hold id '2' not found when removing from expirableHolds"
+		event := setupEvent(t, now, 2)
+		hold := Hold{id: "1", status: HoldStatusActive, quantity: 1, deadline: now}
+		event.holds[hold.id] = hold
+		event.expirableHolds = append(event.expirableHolds, "1")
+		err := event.removeExpirableHold("2")
+		if err == nil {
+			t.Fatalf("expected missing hold id error")
+		}
+		if err.Error() != expected {
+			t.Errorf("expected error '%v', but received '%v'", expected, err.Error())
+		}
+		if !slices.Equal(event.expirableHolds, []string{"1"}) {
+			t.Errorf("expected expirableHolds to remain unchanged, but it was '%+v'", event.expirableHolds)
+		}
+	})
 }
