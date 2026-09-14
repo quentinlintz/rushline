@@ -920,6 +920,7 @@ func TestScanForExpireHolds(t *testing.T) {
 			t.Fatalf("expected availability to be 2, but got: %v", event.getAvailability())
 		}
 		for range 2 {
+			expectedExpirableHolds := []string{"6"}
 			scanErr := event.scanForExpiredHolds(now.Add(time.Minute))
 			if scanErr != nil {
 				t.Fatalf("scanForExpiredHolds failed: %v", scanErr.Error())
@@ -929,6 +930,9 @@ func TestScanForExpireHolds(t *testing.T) {
 			}
 			if len(event.holds) != 6 {
 				t.Errorf("expected hold count to be 6, but got: %v", len(event.holds))
+			}
+			if !slices.Equal(expectedExpirableHolds, event.expirableHolds) {
+				t.Errorf("expected expirableHolds to be '%+v', but got '%+v'", expectedExpirableHolds, event.expirableHolds)
 			}
 
 			for _, hold := range holds {
@@ -962,9 +966,13 @@ func TestScanForExpireHolds(t *testing.T) {
 		if len(event.holds) != 0 {
 			t.Errorf("expected holds to be empty, but got: %v", len(event.holds))
 		}
+		if len(event.expirableHolds) != 0 {
+			t.Errorf("expected expirableHolds to be empty, but got: %v", len(event.expirableHolds))
+		}
 	})
 
 	t.Run("no eligible holds", func(t *testing.T) {
+		expectedExpirableHolds := []string{"1"}
 		holds := []struct {
 			id           string
 			quantity     int
@@ -1037,6 +1045,9 @@ func TestScanForExpireHolds(t *testing.T) {
 		if event.getAvailability() != 4 {
 			t.Errorf("expected availability to be 4, but got: %v", event.getAvailability())
 		}
+		if !slices.Equal(expectedExpirableHolds, event.expirableHolds) {
+			t.Errorf("expected expirableHolds to be '%+v', but got '%+v'", expectedExpirableHolds, event.expirableHolds)
+		}
 		for _, hold := range holdsBefore {
 			storedHold, exists := event.getHoldByID(hold.id)
 			if !exists {
@@ -1046,6 +1057,71 @@ func TestScanForExpireHolds(t *testing.T) {
 			if storedHold != hold {
 				t.Errorf("expected hold with id %v to be %+v, but got %+v", hold.id, hold, storedHold)
 			}
+		}
+	})
+
+	holds := []Hold{
+		{id: "1", quantity: 1, status: HoldStatusExpired, deadline: now.Add(time.Second)},
+		{id: "2", quantity: 1, status: HoldStatusExpired, deadline: now.Add(time.Minute)},
+		{id: "3", quantity: 1, status: HoldStatusExpired, deadline: now.Add(time.Second)},
+	}
+	durations := []time.Duration{time.Second, time.Minute, time.Second}
+
+	t.Run("all holds due", func(t *testing.T) {
+		event := setupEvent(t, now, 3)
+		for i, hold := range holds {
+			_, err := event.createHold(hold.id, hold.quantity, now, durations[i])
+			if err != nil {
+				t.Fatalf("error when creating hold of id '%v': %v", hold.id, err)
+			}
+		}
+		if !slices.Equal(event.expirableHolds, []string{holds[0].id, holds[2].id, holds[1].id}) {
+			t.Fatalf("expirableHolds doesn't contain hold ids after creating holds, contains: %+v", event.expirableHolds)
+		}
+		err := event.scanForExpiredHolds(now.Add(time.Minute))
+		if err != nil {
+			t.Fatalf("expected successful scanForExpiredHolds, but got error '%v'", err.Error())
+		}
+		if len(event.expirableHolds) != 0 {
+			t.Errorf("expected expirableHolds to be empty, but it was %+v", event.expirableHolds)
+		}
+		if event.getAvailability() != 3 {
+			t.Errorf("expected availability to be 3, but it was %v", event.getAvailability())
+		}
+
+		for _, hold := range holds {
+			storedHold := event.holds[hold.id]
+			if storedHold != hold {
+				t.Errorf("expected hold to be '%+v' in map, but it was '%+v'", hold, storedHold)
+			}
+		}
+	})
+
+	t.Run("missing id", func(t *testing.T) {
+		expectedError := "hold with id '2' not found in holds map"
+		event := setupEvent(t, now, 2)
+		hold := setupHold(t, event, now)
+		event.expirableHolds = []string{"2"}
+		availabilityStart := event.getAvailability()
+		err := event.scanForExpiredHolds(now.Add(time.Second))
+		availabilityEnd := event.getAvailability()
+		if err == nil {
+			t.Fatal("expected error from missing hold id in expirableHolds")
+		}
+		if err.Error() != expectedError {
+			t.Errorf("expected error '%v' from scanForExpiredHolds with a missing hold id, but got '%v'", expectedError, err.Error())
+		}
+		if availabilityStart != availabilityEnd {
+			t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+		}
+		if len(event.holds) != 1 {
+			t.Errorf("expected 1 hold to exist in map, but got %v", len(event.holds))
+		}
+		if event.holds[hold.id] != hold {
+			t.Errorf("expected hold with id '%v' to exist in map", hold.id)
+		}
+		if !slices.Equal(event.expirableHolds, []string{"2"}) {
+			t.Errorf("expected expirableHolds to be '2', but got '%v'", event.expirableHolds)
 		}
 	})
 }
@@ -1066,15 +1142,53 @@ func BenchmarkScanForExpireHolds(b *testing.B) {
 			expiredHoldStartIdx := tt.totalHolds - tt.dueHolds
 			event := setupEvent(b, now, tt.totalHolds)
 			for i := range tt.totalHolds {
-				var err error
+				id := strconv.Itoa(i)
 				if i < expiredHoldStartIdx {
-					_, err = event.createHold(strconv.Itoa(i), 1, now, time.Minute)
+					event.holds[id] = Hold{id: id, status: HoldStatusActive, quantity: 1, deadline: now.Add(time.Minute)}
 				} else {
-					_, err = event.createHold(strconv.Itoa(i), 1, now, time.Second)
+					event.holds[id] = Hold{id: id, status: HoldStatusActive, quantity: 1, deadline: now.Add(time.Second)}
+					event.expirableHolds = append(event.expirableHolds, id)
 				}
-				if err != nil {
-					b.Fatalf("failed to create hold with id %v", strconv.Itoa(i))
+			}
+
+			for i := range expiredHoldStartIdx {
+				id := strconv.Itoa(i)
+				event.expirableHolds = append(event.expirableHolds, id)
+			}
+
+			if len(event.expirableHolds) != tt.totalHolds {
+				b.Fatalf("expected %v expirableHolds, but got %v", tt.totalHolds, len(event.expirableHolds))
+			}
+			if len(event.holds) != tt.totalHolds {
+				b.Fatalf("expected %v holds, but got %v", tt.totalHolds, len(event.holds))
+			}
+			lastDeadline := now
+			dueHoldsCount := 0
+			seenIds := make(map[string]struct{})
+			for i := range tt.totalHolds {
+				id := event.expirableHolds[i]
+				_, exists := seenIds[id]
+				if exists {
+					b.Fatalf("id '%v' already exists in holds", id)
 				}
+				hold, exists := event.getHoldByID(id)
+				if !exists {
+					b.Fatalf("hold with id '%v' doesn't exist", id)
+				}
+				if hold.status != HoldStatusActive {
+					b.Fatalf("expected hold with id '%v' to be active, but it was '%v'", id, hold.status)
+				}
+				if lastDeadline.After(hold.deadline) {
+					b.Fatalf("expected hold deadline order to be correct")
+				}
+				if hold.deadline.Equal(now.Add(time.Second)) || hold.deadline.Before(now.Add(time.Second)) {
+					dueHoldsCount++
+				}
+				lastDeadline = hold.deadline
+				seenIds[id] = struct{}{}
+			}
+			if dueHoldsCount != tt.dueHolds {
+				b.Fatalf("expected %v holds due, but got %v", tt.dueHolds, dueHoldsCount)
 			}
 
 			for b.Loop() {
@@ -1091,14 +1205,18 @@ func BenchmarkScanForExpireHolds(b *testing.B) {
 					}
 					if i < expiredHoldStartIdx {
 						if hold.status != HoldStatusActive {
-							b.Errorf("expected hold with id %v to be active, but got '%v'", hold.id, hold.status)
+							b.Fatalf("expected hold with id %v to be active, but got '%v'", hold.id, hold.status)
 						}
 					} else {
 						if hold.status != HoldStatusExpired {
-							b.Errorf("expected hold with id %v to be expired, but got '%v'", hold.id, hold.status)
+							b.Fatalf("expected hold with id %v to be expired, but got '%v'", hold.id, hold.status)
 						}
 						hold.status = HoldStatusActive
 						event.holds[idx] = hold
+						err := event.insertExpirableHold(hold)
+						if err != nil {
+							b.Fatalf("failed to insert id of '%v' from expirableHolds: %v", idx, err.Error())
+						}
 					}
 				}
 				b.StartTimer()

@@ -251,12 +251,22 @@ func (e *Event) expireHoldLocked(id string, currentTime time.Time) (Hold, error)
 func (e *Event) scanForExpiredHolds(currentTime time.Time) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	for id, hold := range e.holds {
-		if hold.status == HoldStatusActive && (currentTime.After(hold.deadline) || currentTime.Equal(hold.deadline)) {
-			_, err := e.expireHoldLocked(id, currentTime)
-			if err != nil {
-				return err
-			}
+	return e.scanForExpiredHoldsLocked(currentTime)
+}
+
+func (e *Event) scanForExpiredHoldsLocked(currentTime time.Time) error {
+	for len(e.expirableHolds) > 0 {
+		id := e.expirableHolds[0]
+		hold, exists := e.getHoldByIDLocked(id)
+		if !exists {
+			return fmt.Errorf("hold with id '%v' not found in holds map", id)
+		}
+		if currentTime.Before(hold.deadline) {
+			return nil
+		}
+		_, err := e.expireHoldLocked(id, currentTime)
+		if err != nil {
+			return err
 		}
 	}
 	return nil
@@ -330,6 +340,12 @@ func (e *Event) removeExpirableHold(id string) error {
 }
 
 func (e *Event) removeExpirableHoldLocked(id string) error {
+	if len(e.expirableHolds) != 0 && e.expirableHolds[0] == id {
+		e.expirableHolds[0] = ""
+		e.expirableHolds = e.expirableHolds[1:]
+		return nil
+	}
+
 	for i := range len(e.expirableHolds) {
 		if id == e.expirableHolds[i] {
 			e.expirableHolds = slices.Delete(e.expirableHolds, i, i+1)
