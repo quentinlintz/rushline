@@ -12,7 +12,8 @@ type Event struct {
 	id             string
 	capacity       int
 	holds          map[string]Hold
-	expirableHolds []string // Active holds ordered by deadline
+	expirableHolds []string        // Active holds ordered by deadline
+	operations     map[string]Hold // History of successful confirmation results with unique keys
 
 	onsaleOpening      time.Time
 	holdCreationCutoff time.Time
@@ -40,6 +41,7 @@ func newEvent(id string, capacity int, onsaleOpening, holdCreationCutoff, confir
 		id:                 id,
 		capacity:           capacity,
 		holds:              make(map[string]Hold),
+		operations:         make(map[string]Hold),
 		onsaleOpening:      onsaleOpening,
 		holdCreationCutoff: holdCreationCutoff,
 		confirmationCutoff: confirmationCutoff,

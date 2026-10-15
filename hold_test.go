@@ -1,6 +1,7 @@
 package rushline
 
 import (
+	"maps"
 	"math"
 	"slices"
 	"testing"
@@ -189,7 +190,7 @@ func TestConfirmHold(t *testing.T) {
 		event := setupEvent(t, now, 5)
 		hold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
-		confirmedHold, err := event.confirmHold(id, now)
+		confirmedHold, err := event.confirmHold(id, now, "1")
 		if err != nil {
 			t.Fatalf("confirmHold returned error: '%v'", err)
 		}
@@ -248,7 +249,7 @@ func TestConfirmHold(t *testing.T) {
 			}
 			event.holds[tt.id] = hold
 			assertExpirableHoldMembership(t, event)
-			_, err := event.confirmHold(tt.id, tt.currentTime)
+			_, err := event.confirmHold(tt.id, tt.currentTime, "1")
 			storedHold, found := event.getHoldByID(tt.id)
 			availabilityEnd := event.getAvailability()
 			if !found {
@@ -281,7 +282,7 @@ func TestConfirmHold(t *testing.T) {
 
 	t.Run("hold not found", func(t *testing.T) {
 		event := setupEvent(t, now, 5)
-		_, got := event.confirmHold("1", now)
+		_, got := event.confirmHold("1", now, "1")
 		wantErr := "hold not found"
 		if got == nil {
 			t.Errorf("Wanted error: '%v'", wantErr)
@@ -306,7 +307,7 @@ func TestConfirmHold(t *testing.T) {
 			holdBefore := setupHold(t, event, now)
 			event.expirableHolds = []string{}
 			availabilityStart := event.getAvailability()
-			_, err := event.confirmHold(holdBefore.id, tt.confirmationTime)
+			_, err := event.confirmHold(holdBefore.id, tt.confirmationTime, "1")
 			holdAfter, _ := event.getHoldByID("1")
 			availabilityEnd := event.getAvailability()
 			if err == nil {
@@ -326,6 +327,111 @@ func TestConfirmHold(t *testing.T) {
 			}
 		})
 	}
+
+	replayTests := []struct {
+		name             string
+		confirmationTime time.Time
+	}{
+		{"same key and hold replay before deadline", now},
+		{"same key and hold replay after deadline", now.Add(time.Hour * 2)},
+	}
+
+	for _, tt := range replayTests {
+		t.Run(tt.name, func(t *testing.T) {
+			event := setupEvent(t, now, 5)
+			setupHold(t, event, now)
+			availabilityStart := event.getAvailability()
+			hold, err := event.confirmHold("1", now, "1")
+			if err != nil {
+				t.Fatalf("expected no error confirming, but received: '%v'", err)
+			}
+			holdReplay, errReplay := event.confirmHold("1", tt.confirmationTime, "1")
+			availabilityEnd := event.getAvailability()
+			if errReplay != nil {
+				t.Fatalf("expected no error confirming, but received: '%v'", errReplay)
+			}
+			if hold != holdReplay {
+				t.Error("expected replayed hold to equal original hold")
+			}
+			if availabilityStart != availabilityEnd {
+				t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+			}
+			if slices.Contains(event.expirableHolds, hold.id) {
+				t.Error("expected confirmed hold to not be in expirable holds")
+			}
+			storedHold, found := event.getHoldByID("1")
+			if !found {
+				t.Error("expected hold to be stored")
+			}
+			if holdReplay != storedHold {
+				t.Error("expected stored hold to match replayed hold")
+			}
+		})
+	}
+
+	t.Run("rejects same key with different hold", func(t *testing.T) {
+		event := setupEvent(t, now, 5)
+		setupHold(t, event, now)
+		holdTwo, err := event.createHold("2", 1, now, time.Minute)
+		if err != nil {
+			t.Fatalf("tried creating a valid hold, but got: '%v'", err.Error())
+		}
+		holdOne, err := event.confirmHold("1", now, "1")
+		if err != nil {
+			t.Fatalf("expected no error confirming, but received: '%v'", err)
+		}
+		_, errReplay := event.confirmHold("2", now, "1")
+		if errReplay == nil {
+			t.Error("expected error for using existing key on different hold")
+		}
+		newHoldOne, _ := event.getHoldByID("1")
+		newHoldTwo, _ := event.getHoldByID("2")
+		if holdOne != newHoldOne {
+			t.Error("expected hold with id '1' to remain unchanged")
+		}
+		if holdTwo != newHoldTwo {
+			t.Error("expected hold with id '2' to remain unchanged")
+		}
+		holdOneRetry, errReplay := event.confirmHold("1", now, "1")
+		if errReplay != nil {
+			t.Fatalf("expected no error confirming, but received: '%v'", errReplay)
+		}
+		if holdOne != holdOneRetry {
+			t.Error("expected replayed hold to equal original hold")
+		}
+	})
+
+	t.Run("rejects empty key", func(t *testing.T) {
+		event := setupEvent(t, now, 5)
+		hold := setupHold(t, event, now)
+		availabilityStart := event.getAvailability()
+		operationsBefore := maps.Clone(event.operations)
+		_, err := event.confirmHold("1", now, "")
+		if err == nil {
+			t.Fatal("expected error when confirming with empty key")
+		}
+		availabilityEnd := event.getAvailability()
+		operationsAfter := maps.Clone(event.operations)
+		if err.Error() != "operation key is required" {
+			t.Errorf("expected error 'operation key is required', but received: '%v'", err.Error())
+		}
+		if availabilityStart != availabilityEnd {
+			t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+		}
+		if !slices.Contains(event.expirableHolds, hold.id) {
+			t.Error("expected active hold to be in expirable holds")
+		}
+		storedHold, found := event.getHoldByID("1")
+		if !found {
+			t.Error("expected hold to be stored")
+		}
+		if hold != storedHold {
+			t.Error("expected stored hold to match replayed hold")
+		}
+		if !maps.Equal(operationsBefore, operationsAfter) {
+			t.Error("expected operations to be unchanged")
+		}
+	})
 }
 
 func TestCancelHold(t *testing.T) {
@@ -631,7 +737,7 @@ func TestConfirmCancelHoldConcurrent(t *testing.T) {
 			holdChan <- holdResult{hold, err}
 		}()
 		go func() {
-			hold, err := event.confirmHold("1", now)
+			hold, err := event.confirmHold("1", now, "1")
 			holdChan <- holdResult{hold, err}
 		}()
 
@@ -710,7 +816,7 @@ func TestConfirmExpireHoldConcurrent(t *testing.T) {
 	availabilityStart := event.getAvailability()
 
 	go func() {
-		hold, err := event.confirmHold("1", hold.deadline)
+		hold, err := event.confirmHold("1", hold.deadline, "1")
 		holdChan <- holdResult{hold, err}
 	}()
 	go func() {
@@ -773,5 +879,46 @@ func TestConfirmExpireHoldConcurrent(t *testing.T) {
 	}
 	if availabilityStart != availabilityEnd-hold.quantity {
 		t.Errorf("expected availability to increase by hold quantity, got start %v and end %v available", availabilityStart, availabilityEnd)
+	}
+}
+
+func TestConfirmTwiceConcurrent(t *testing.T) {
+	holdChan := make(chan holdResult)
+	event := setupEvent(t, now, 5)
+	hold := setupHold(t, event, now)
+	availabilityStart := event.getAvailability()
+
+	go func() {
+		hold, err := event.confirmHold("1", now, "1")
+		holdChan <- holdResult{hold, err}
+	}()
+	go func() {
+		hold, err := event.confirmHold("1", now, "1")
+		holdChan <- holdResult{hold, err}
+	}()
+
+	for range 2 {
+		result := <-holdChan
+		if result.err != nil {
+			t.Errorf("expected successful transition, but got '%v'", result.err)
+		}
+		if result.hold.status != HoldStatusConfirmed {
+			t.Errorf("expected hold to be confirmed, but got %v", result.hold.status)
+		}
+		storedHold, found := event.getHoldByID("1")
+		if !found {
+			t.Error("expected hold to be stored")
+		}
+		if result.hold != storedHold {
+			t.Error("expected stored hold to match replayed hold")
+		}
+	}
+
+	availabilityEnd := event.getAvailability()
+	if availabilityStart != availabilityEnd {
+		t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+	}
+	if slices.Contains(event.expirableHolds, hold.id) {
+		t.Error("expected confirmed hold to not be in expirable holds")
 	}
 }

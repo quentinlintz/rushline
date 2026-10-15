@@ -47,7 +47,7 @@ func TestScanForExpireHolds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cancelling hold failed: %v", err.Error())
 		}
-		_, err = event.confirmHold("3", now.Add(time.Minute))
+		_, err = event.confirmHold("3", now.Add(time.Minute), "1")
 		if err != nil {
 			t.Fatalf("confirming hold failed: %v", err.Error())
 		}
@@ -143,7 +143,7 @@ func TestScanForExpireHolds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cancelling hold failed: %v", err.Error())
 		}
-		_, err = event.confirmHold("3", now)
+		_, err = event.confirmHold("3", now, "1")
 		if err != nil {
 			t.Fatalf("confirming hold failed: %v", err.Error())
 		}
@@ -155,7 +155,7 @@ func TestScanForExpireHolds(t *testing.T) {
 		if err != nil {
 			t.Fatalf("cancelling hold failed: %v", err.Error())
 		}
-		_, err = event.confirmHold("6", now)
+		_, err = event.confirmHold("6", now, "2")
 		if err != nil {
 			t.Fatalf("confirming hold failed: %v", err.Error())
 		}

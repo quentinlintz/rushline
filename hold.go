@@ -76,17 +76,29 @@ func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdD
 	return newHold, nil
 }
 
-func (e *Event) confirmHold(id string, currentTime time.Time) (Hold, error) {
+func (e *Event) confirmHold(id string, currentTime time.Time, key string) (Hold, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	return e.confirmHoldLocked(id, currentTime)
+	return e.confirmHoldLocked(id, currentTime, key)
 }
 
-func (e *Event) confirmHoldLocked(id string, currentTime time.Time) (Hold, error) {
+func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) (Hold, error) {
+	opHold, opFound := e.operations[key]
+	if opFound {
+		if opHold.id != id {
+			return Hold{}, errors.New("key exists but hold ids do not match")
+		}
+		return opHold, nil
+	}
+
 	hold, ok := e.getHoldByIDLocked(id)
 
 	if !ok {
 		return Hold{}, errors.New("hold not found")
+	}
+
+	if len(key) == 0 {
+		return Hold{}, errors.New("operation key is required")
 	}
 
 	switch hold.status {
@@ -108,6 +120,7 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time) (Hold, error
 		}
 		hold.status = HoldStatusConfirmed
 		e.holds[id] = hold
+		e.operations[key] = hold
 		return e.holds[id], nil
 	case HoldStatusConfirmed:
 		return Hold{}, errors.New("hold is already confirmed")
