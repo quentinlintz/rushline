@@ -1,0 +1,149 @@
+openapi: 3.1.0
+x-stoplight:
+  id: v6s4a0wuxtdki
+info:
+  title: rushline
+  version: "1.0"
+  summary: A headless inventory reservation and allocation service for high-demand ticket sales.
+servers:
+  - url: "http://localhost:3000"
+paths:
+  "/events/{eventId}/holds/{holdId}/confirm":
+    parameters:
+      - schema:
+          type: string
+        name: eventId
+        in: path
+        required: true
+      - schema:
+          type: string
+        name: holdId
+        in: path
+        required: true
+    post:
+      summary: Confirm hold
+      tags: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - hold
+                properties:
+                  hold:
+                    $ref: "#/components/schemas/Hold"
+                    x-stoplight:
+                      id: i3cmzifkphd7o
+        "400":
+          description: Bad Request
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                  - code
+                properties:
+                  message:
+                    type: string
+                    x-stoplight:
+                      id: ws380cewk8cvd
+                  code:
+                    x-stoplight:
+                      id: cc707ibvyam0n
+                    enum:
+                      - operation_key_required
+        "404":
+          description: Not Found
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                  - code
+                properties:
+                  message:
+                    type: string
+                    x-stoplight:
+                      id: 06ad43liwpexy
+                  code:
+                    x-stoplight:
+                      id: wh7o0dzpebxgk
+                    enum:
+                      - event_not_found
+                      - hold_not_found
+        "409":
+          description: Conflict
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                  - code
+                properties:
+                  message:
+                    type: string
+                    x-stoplight:
+                      id: x88iipa6unw37
+                  code:
+                    x-stoplight:
+                      id: yb2sm8w5dpp4y
+                    enum:
+                      - hold_already_confirmed
+                      - hold_cancelled
+                      - hold_expired
+                      - operation_key_conflict
+      operationId: post-events-eventId-holds-holdId-confirm
+      x-stoplight:
+        id: 8q0d833keyo2q
+      description: "Confirm an active hold by requesting with a unique operation key in the header. This key should be unique per event. An identical retry will return a 200 with the original stored successful outcome if used in a future request, including after the hold confirmation deadline. An existing key with a different hold ID will be rejected."
+      parameters:
+        - schema:
+            type: string
+            minLength: 1
+          in: header
+          name: operation-key
+          description: A unique key identifying this request to transition a hold
+          required: true
+components:
+  schemas:
+    Hold:
+      title: Hold
+      x-stoplight:
+        id: lsvruw59dlgci
+      type: object
+      description: A hold on an event's inventory
+      required:
+        - id
+        - status
+        - quantity
+        - deadline
+      properties:
+        id:
+          type: string
+          x-stoplight:
+            id: st6dcfeocjhxg
+        status:
+          x-stoplight:
+            id: cxfcvpldrik6e
+          enum:
+            - active
+            - confirmed
+            - cancelled
+            - expired
+        quantity:
+          type: integer
+          x-stoplight:
+            id: pqw0xzr62dd3n
+          minimum: 1
+        deadline:
+          type: string
+          x-stoplight:
+            id: 9re0zncmnyqhq
+          format: date-time
+x-internal: false
