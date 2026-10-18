@@ -1,6 +1,7 @@
 package rushline
 
 import (
+	"errors"
 	"maps"
 	"math"
 	"slices"
@@ -225,15 +226,15 @@ func TestConfirmHold(t *testing.T) {
 		endStatus       HoldStatus
 		endAvailability int
 		currentTime     time.Time
-		wantErr         string
+		wantErr         error
 	}{
-		{"has unknown status", "1", 123, 123, 5, now, "hold has unknown status"},
-		{"has invalid status", "1", HoldStatusInvalid, HoldStatusInvalid, 5, now, "cannot confirm hold of status 'invalid'"},
-		{"has cancelled status", "1", HoldStatusCancelled, HoldStatusCancelled, 5, now, "cannot confirm hold of status 'cancelled'"},
-		{"has expired status", "1", HoldStatusExpired, HoldStatusExpired, 5, now, "cannot confirm hold of status 'expired'"},
-		{"hold confirmed after deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(2 * time.Hour), "can only transition hold before confirmation deadline"},
-		{"has confirmed on deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(time.Minute), "can only transition hold before confirmation deadline"},
-		{"has already confirmed", "1", HoldStatusConfirmed, HoldStatusConfirmed, 4, now, "hold is already confirmed"},
+		{"has unknown status", "1", 123, 123, 5, now, ErrHoldUnknownStatus},
+		{"has invalid status", "1", HoldStatusInvalid, HoldStatusInvalid, 5, now, ErrHoldConfirmInvalid},
+		{"has cancelled status", "1", HoldStatusCancelled, HoldStatusCancelled, 5, now, ErrHoldAlreadyCancelled},
+		{"has expired status", "1", HoldStatusExpired, HoldStatusExpired, 5, now, ErrHoldConfirmExpired},
+		{"hold confirmed after deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(2 * time.Hour), ErrAfterConfirmationDeadline},
+		{"has confirmed on deadline", "1", HoldStatusActive, HoldStatusExpired, 5, now.Add(time.Minute), ErrAfterConfirmationDeadline},
+		{"has already confirmed", "1", HoldStatusConfirmed, HoldStatusConfirmed, 4, now, ErrHoldAlreadyConfirmed},
 	}
 
 	for _, tt := range tests {
@@ -258,7 +259,7 @@ func TestConfirmHold(t *testing.T) {
 			if err == nil {
 				t.Errorf("confirmHold wanted error: '%v'", tt.wantErr)
 			}
-			if err != nil && err.Error() != tt.wantErr {
+			if err != nil && !errors.Is(err, tt.wantErr) {
 				t.Errorf("confirmHold error: '%v'; want '%v'", err.Error(), tt.wantErr)
 			}
 			if storedHold.status != tt.endStatus {
@@ -752,7 +753,7 @@ func TestConfirmCancelHoldConcurrent(t *testing.T) {
 				successCount++
 				continue
 			}
-			if result.err.Error() != "cannot cancel hold of status 'confirmed'" && result.err.Error() != "cannot confirm hold of status 'cancelled'" {
+			if result.err.Error() != "cannot cancel hold of status 'confirmed'" && !errors.Is(result.err, ErrHoldAlreadyCancelled) {
 				t.Errorf("expected cannot cancel/confirm error, but received: '%v'", result.err.Error())
 			}
 			failedError = result.err
@@ -797,8 +798,8 @@ func TestConfirmCancelHoldConcurrent(t *testing.T) {
 			if availabilityStart+hold.quantity != availabilityEnd {
 				t.Errorf("expected %v available holds, but got %v", availabilityStart+hold.quantity, availabilityEnd)
 			}
-			if failedError.Error() != "cannot confirm hold of status 'cancelled'" {
-				t.Errorf("expected error: cannot confirm hold of status 'cancelled', but got %v", failedError.Error())
+			if !errors.Is(failedError, ErrHoldAlreadyCancelled) {
+				t.Errorf("expected error: %v, but got %v", ErrHoldAlreadyCancelled.Error(), failedError.Error())
 			}
 		default:
 			t.Errorf("stored hold has invalid status: '%v'", storedHold.status)

@@ -22,6 +22,18 @@ type Hold struct {
 	deadline time.Time
 }
 
+var (
+	ErrHoldNotFound              = errors.New("hold not found")
+	ErrHoldAlreadyConfirmed      = errors.New("hold is already confirmed")
+	ErrHoldAlreadyCancelled      = errors.New("hold is already cancelled")
+	ErrHoldConfirmInvalid        = errors.New("cannot confirm hold of status 'invalid'")
+	ErrHoldConfirmExpired        = errors.New("cannot confirm hold of status 'expired'")
+	ErrOperationKeyConflict      = errors.New("key exists but hold ids do not match")
+	ErrOperationKeyEmpty         = errors.New("operation key is required")
+	ErrAfterConfirmationDeadline = errors.New("can only transition hold before confirmation deadline")
+	ErrHoldUnknownStatus         = errors.New("hold has unknown status")
+)
+
 func (e *Event) createHold(id string, quantity int, currentTime time.Time, holdDuration time.Duration) (Hold, error) {
 	if holdDuration <= 0 {
 		return Hold{}, errors.New("holdDuration must be in the future")
@@ -86,7 +98,7 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) 
 	opHold, opFound := e.operations[key]
 	if opFound {
 		if opHold.id != id {
-			return Hold{}, errors.New("key exists but hold ids do not match")
+			return Hold{}, ErrOperationKeyConflict
 		}
 		return opHold, nil
 	}
@@ -94,16 +106,16 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) 
 	hold, ok := e.getHoldByIDLocked(id)
 
 	if !ok {
-		return Hold{}, errors.New("hold not found")
+		return Hold{}, ErrHoldNotFound
 	}
 
 	if len(key) == 0 {
-		return Hold{}, errors.New("operation key is required")
+		return Hold{}, ErrOperationKeyEmpty
 	}
 
 	switch hold.status {
 	case HoldStatusInvalid:
-		return Hold{}, errors.New("cannot confirm hold of status 'invalid'")
+		return Hold{}, ErrHoldConfirmInvalid
 	case HoldStatusActive:
 		if currentTime.After(hold.deadline) || currentTime.Equal(hold.deadline) {
 			err := e.removeExpirableHoldLocked(id)
@@ -112,7 +124,7 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) 
 			}
 			hold.status = HoldStatusExpired
 			e.holds[id] = hold
-			return Hold{}, errors.New("can only transition hold before confirmation deadline")
+			return Hold{}, ErrAfterConfirmationDeadline
 		}
 		err := e.removeExpirableHoldLocked(id)
 		if err != nil {
@@ -123,13 +135,13 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) 
 		e.operations[key] = hold
 		return e.holds[id], nil
 	case HoldStatusConfirmed:
-		return Hold{}, errors.New("hold is already confirmed")
+		return Hold{}, ErrHoldAlreadyConfirmed
 	case HoldStatusCancelled:
-		return Hold{}, errors.New("cannot confirm hold of status 'cancelled'")
+		return Hold{}, ErrHoldAlreadyCancelled
 	case HoldStatusExpired:
-		return Hold{}, errors.New("cannot confirm hold of status 'expired'")
+		return Hold{}, ErrHoldConfirmExpired
 	default:
-		return Hold{}, errors.New("hold has unknown status")
+		return Hold{}, ErrHoldUnknownStatus
 	}
 }
 
