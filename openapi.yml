@@ -76,6 +76,25 @@ paths:
                     enum:
                       - event_not_found
                       - hold_not_found
+        "405":
+          description: Method Not Allowed
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                  - code
+                properties:
+                  message:
+                    type: string
+                    x-stoplight:
+                      id: 9nojg57y2i8ow
+                  code:
+                    x-stoplight:
+                      id: k9e6aq550nraz
+                    enum:
+                      - method_not_allowed
         "409":
           description: Conflict
           content:
@@ -98,6 +117,26 @@ paths:
                       - hold_cancelled
                       - hold_expired
                       - operation_key_conflict
+                      - after_confirmation_deadline
+        "500":
+          description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                  - code
+                properties:
+                  message:
+                    type: string
+                    x-stoplight:
+                      id: nfx0cwraqz6kj
+                  code:
+                    x-stoplight:
+                      id: p9mpd4bor18w2
+                    enum:
+                      - internal_error
       operationId: post-events-eventId-holds-holdId-confirm
       x-stoplight:
         id: 8q0d833keyo2q

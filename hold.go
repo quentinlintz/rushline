@@ -29,7 +29,7 @@ var (
 	ErrHoldConfirmInvalid        = errors.New("cannot confirm hold of status 'invalid'")
 	ErrHoldConfirmExpired        = errors.New("cannot confirm hold of status 'expired'")
 	ErrOperationKeyConflict      = errors.New("key exists but hold ids do not match")
-	ErrOperationKeyEmpty         = errors.New("operation key is required")
+	ErrOperationKeyRequired      = errors.New("operation key is required")
 	ErrAfterConfirmationDeadline = errors.New("can only transition hold before confirmation deadline")
 	ErrHoldUnknownStatus         = errors.New("hold has unknown status")
 )
@@ -110,7 +110,7 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) 
 	}
 
 	if len(key) == 0 {
-		return Hold{}, ErrOperationKeyEmpty
+		return Hold{}, ErrOperationKeyRequired
 	}
 
 	switch hold.status {
