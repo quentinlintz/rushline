@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 )
@@ -469,4 +470,85 @@ func TestConfirmHoldHandler(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestConfirmHoldHandlerConcurrent(t *testing.T) {
+	t.Run("confirm two concurrent hold requests", func(t *testing.T) {
+		responseChan := make(chan *httptest.ResponseRecorder)
+		clock := MockClock{
+			StaticTime: now,
+		}
+		event := setupEvent(t, now, 1)
+		expectedHold := setupHold(t, event, now)
+		expectedHold.status = HoldStatusConfirmed
+		availabilityStart := event.getAvailability()
+		server, err := initServer(&clock)
+		if err != nil {
+			t.Fatalf("failed to init server, %v", err.Error())
+		}
+		server.addEvent(event)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
+
+		for range 2 {
+			go func() {
+				req := httptest.NewRequest(http.MethodPost, "/events/1/holds/1/confirm", nil)
+				req.Header.Set("operation-key", "1")
+				rr := httptest.NewRecorder()
+				mux.ServeHTTP(rr, req)
+				responseChan <- rr
+			}()
+		}
+
+		for range 2 {
+			rr := <-responseChan
+			var body SuccessResponse
+			err = json.NewDecoder(rr.Body).Decode(&body)
+			if err != nil {
+				t.Fatalf("failed to decode success response: %v", err)
+			}
+			status := rr.Code
+			contentTypeHeader := rr.Header().Get("Content-Type")
+			if status != http.StatusOK {
+				t.Errorf("handler returned wrong status code: got %v want %v", status, http.StatusOK)
+			}
+			if contentTypeHeader != "application/json; charset=utf-8" {
+				t.Errorf("expected 'Content-Type: application/json; charset=utf-8', but was 'Content-Type: %v'", contentTypeHeader)
+			}
+			if body.Hold.ID != expectedHold.id {
+				t.Errorf("expected body hold id to be %v, but got %v", expectedHold.id, body.Hold.ID)
+			}
+			if body.Hold.Quantity != expectedHold.quantity {
+				t.Errorf("expected body hold quantity to be %v, but got %v", expectedHold.quantity, body.Hold.Quantity)
+			}
+			if !body.Hold.Deadline.Equal(expectedHold.deadline) {
+				t.Errorf("expected body hold deadline to be %v, but got %v", expectedHold.deadline, body.Hold.Deadline)
+			}
+			if body.Hold.Status != "confirmed" {
+				t.Errorf("expected body hold status to be 'confirmed', but got '%v'", body.Hold.Status)
+			}
+		}
+
+		storedHold, exists := event.getHoldByID("1")
+		availabilityEnd := event.getAvailability()
+		if !exists {
+			t.Error("stored hold not found")
+		}
+		if storedHold != expectedHold {
+			t.Errorf("expected stored hold be %v, but it was %v", expectedHold, storedHold)
+		}
+		if availabilityStart != availabilityEnd {
+			t.Errorf("expected availability to be %v, but it was %v", availabilityStart, availabilityEnd)
+		}
+		if len(event.operations) != 1 {
+			t.Errorf("expected only one operation with identical, concurrent transition requests, instead got %v", len(event.operations))
+		}
+		if operation := event.operations["1"]; operation != expectedHold {
+			t.Errorf("expected operation to match expected hold, instead contains %v", operation)
+		}
+		if slices.Contains(event.expirableHolds, storedHold.id) {
+			t.Errorf("expected expirable holds to not contain hold, but contains %v", event.expirableHolds)
+		}
+	})
 }
