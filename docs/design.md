@@ -99,9 +99,9 @@ We can derive availability if we keep `capacity` set when the Event is first cre
 - **created_at**: timestamptz, server-owned metadata
 - **updated_at**: timestamptz, last persisted config change, initially equal to created_at
 - **capacity**: positive integer
-- **onsaleOpening**: timestamptz, must be in the future, checked on creation
-- **holdCreationCutoff**: timestamptz, must be after onsaleOpening, checked on creation
-- **confirmationCutoff**: timestamptz, must be after holdCreationCutoff, checked on creation
+- **onsale_opening**: timestamptz, must be in the future, checked on creation
+- **hold_creation_cutoff**: timestamptz, must be after onsale_opening, checked on creation
+- **confirmation_cutoff**: timestamptz, must be after hold_creation_cutoff, checked on creation
 
 ### Hold
 
