@@ -88,3 +88,66 @@ Event time is separate from the onsale window. Onsale opening allows for new hol
 - Before evaluating the table, Rushline checks the idempotency key. The same key and payload returns the stored outcome without reevaluating the transition. The same key with a different payload is rejected.
 - Effective deadline = min(hold expiration, confirmation cutoff).
 - A background expiration process expires overdue holds. Every operation that depends on an active hold also validates its effective deadline.
+
+## Data Models
+
+### Event
+
+We can derive availability if we keep `capacity` set when the Event is first created because the Hold table's quantities can be summed, so we should not store availability as a field. Holds that consume availability are active or confirmed.
+
+- **id**: unique among events, string
+- **created_at**: timestamptz, server-owned metadata
+- **updated_at**: timestamptz, last persisted config change, initially equal to created_at
+- **capacity**: positive integer
+- **onsaleOpening**: timestamptz, must be in the future, checked on creation
+- **holdCreationCutoff**: timestamptz, must be after onsaleOpening, checked on creation
+- **confirmationCutoff**: timestamptz, must be after holdCreationCutoff, checked on creation
+
+### Hold
+
+An index will hold active holds ordered by deadline, so we can quickly scan which holds should be expired. Currently, `event.go` contains a slice of strings, `expirableHolds`, that is maintained for scanning. Another useful index could be status and quantity so consumed availability can be quickly calculated.
+
+- **id**: unique within an event, string
+- **created_at**: timestamptz, server-owned metadata
+- **updated_at**: timestamptz, server-owned metadata
+- **status**: enum, 1-4 (active, confirmed, cancelled, expired)
+- **quantity**: positive integer
+- **deadline**: timestamptz, must be after creation of the hold
+- **event_id**: foreign key to *one* Event
+
+### Operation
+
+Outcome of an operation that references a Hold snapshot. Operations are results of successful hold transition outcomes so the client can replay by sending a request for the *same* hold id and operation key in the header.
+
+- **id**: unique within an event, string (operation key from the header of the request)
+- **created_at**: timestamptz, server-owned metadata
+- **status**: enum, 1-4 (active, confirmed, cancelled, expired)
+- **quantity**: positive, integer
+- **deadline**: timestamptz, must be after creation of the hold
+- **event_id**: foreign key to *one* Event
+- **hold_id**: foreign key to the *one* Hold that belongs to the Event in event_id
+
+## Confirming
+
+Past operations are searched for an event-scoped operation key. If the key and requested hold id match, the recorded snapshot is returned to the client, even after the deadline. This allows confirmations to be replayed when a response has been lost. Reusing the same event/key with a different hold is rejected with an "operation key conflict".
+
+Flow for confirming a hold:
+
+1. Start the transaction with Read Committed isolation.
+2. If the event exists, establish event-row lock for concurrency protection. This is so a second request waits, then checks for a committed outcome (release this lock when the transaction ends).
+3. Read operations for the event-scoped key. If an operation is found, compare its hold id with the requested hold id. A match selects the recorded snapshot for replay; a different hold id is rejected as a key conflict. Neither case transitions the hold again.
+4. If no operation is found, read the event and hold. Reject if either is missing, and apply the status and deadline guards from the transition table.
+5. For an eligible hold, update its status from "active" to "confirmed"
+6. Record the successful operation outcome.
+7. Commit before returning the successful outcome to the client. Replay and rejection paths must also finish their transaction and release any locks before responding.
+
+If a database failure aborts the transaction, its changes are rolled back. For example, if the operation row cannot be inserted, the hold status mutation must also be rolled back. The overdue-hold rejection follows the transition table: the hold becomes expired and releases inventory, without recording a successful confirmation outcome.
+
+Concurrent requests for the same hold with matching operation keys must be coordinated before making their decisions. If the first request commits, the second waits until the commit occurs, reads, and then replays its recorded outcome. If rolled back, the second request will be evaluated normally. A later request for the same confirmed hold with a different operation key is rejected as "hold already confirmed".
+
+How the concurrency works:
+
+1. Identical requests A and B are received simultaneously.
+2. Request A acquires the lock while B waits to read anything until the transaction releases it.
+3. If A succeeds in confirming and commits, the lock is released and B reads operations for the event-scoped key, finds it, and responds with the same outcome as A. B can replay the outcome even if A's response is lost
+4. If A's transaction aborts, the status is rolled back (no changes persist from that transaction) and B begins the process normally, after acquiring the lock it reads operations for the event-scoped key.
