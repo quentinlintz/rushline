@@ -32,7 +32,15 @@ func TestRepository(t *testing.T) {
 				wait.ForLog("database system is ready to accept connections").
 					WithOccurrence(2).WithStartupTimeout(5*time.Second)),
 		)
+		if pgContainer == nil {
+			t.Fatalf("pgContainer is nil: %s", err)
+		}
 		if err != nil {
+			cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+			defer cancelCleanup()
+			if termErr := pgContainer.Terminate(cleanupCtx); termErr != nil {
+				t.Errorf("failed to terminate pgContainer: %s", termErr)
+			}
 			t.Fatal(err)
 		}
 
