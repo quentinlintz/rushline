@@ -27,13 +27,22 @@ func TestRepository(t *testing.T) {
 			postgres.WithDatabase("rushline"),
 			postgres.WithUsername("postgres"),
 			postgres.WithPassword("mysecretpass"),
-			testcontainers.WithWaitStrategy(
+			testcontainers.WithWaitStrategyAndDeadline(
+				time.Minute,
 				wait.ForLog("database system is ready to accept connections").
 					WithOccurrence(2).WithStartupTimeout(5*time.Second)),
 		)
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		t.Cleanup(func() {
+			cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+			defer cancelCleanup()
+			if err := pgContainer.Terminate(cleanupCtx); err != nil {
+				t.Fatalf("failed to terminate pgContainer: %s", err)
+			}
+		})
 
 		connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 		require.NoError(t, err)
@@ -42,12 +51,10 @@ func TestRepository(t *testing.T) {
 		require.NoError(t, err)
 
 		t.Cleanup(func() {
-			cleanupCtx := context.Background()
+			cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+			defer cancelCleanup()
 			if err := repo.conn.Close(cleanupCtx); err != nil {
 				t.Fatalf("failed to close connection: %s", err)
-			}
-			if err = pgContainer.Terminate(cleanupCtx); err != nil {
-				t.Fatalf("failed to terminate pgContainer: %s", err)
 			}
 		})
 
