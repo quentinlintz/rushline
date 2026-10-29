@@ -85,10 +85,13 @@ func (r Repository) ConfirmHold(ctx context.Context, id string, operationKey str
 	}
 
 	err = tx.QueryRow(ctx,
-		"SELECT hold_id, status, quantity, deadline FROM operations WHERE id = $1 AND hold_id = $2 AND event_id = $3",
-		operationKey, id, eventId).Scan(&hold.id, &hold.status, &hold.quantity, &hold.deadline)
+		"SELECT hold_id, status, quantity, deadline FROM operations WHERE id = $1 AND event_id = $2",
+		operationKey, eventId).Scan(&hold.id, &hold.status, &hold.quantity, &hold.deadline)
 	if err == nil {
-		return hold, nil
+		if hold.id == id {
+			return hold, nil
+		}
+		return Hold{}, ErrOperationKeyConflict
 	} else if err != pgx.ErrNoRows {
 		return Hold{}, err
 	}
