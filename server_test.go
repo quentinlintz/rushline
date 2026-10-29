@@ -2,6 +2,7 @@ package rushline
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -398,6 +399,10 @@ func TestConfirmHoldHandler(t *testing.T) {
 	}{
 		{"operation key missing header", "1", "1", HoldStatusActive, "", true, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
 		{"operation key empty header", "1", "1", HoldStatusActive, "", false, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
+		{"operation key missing header, event not found", "0", "1", HoldStatusActive, "", true, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
+		{"operation key empty header, event not found", "0", "1", HoldStatusActive, "", false, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
+		{"operation key missing header, hold not found", "1", "0", HoldStatusActive, "", true, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
+		{"operation key empty header, hold not found", "1", "0", HoldStatusActive, "", false, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
 		{"event not found", "2", "1", HoldStatusActive, "1", false, 404, "event_not_found", "event does not exist"},
 		{"hold not found", "1", "0", HoldStatusActive, "1", false, 404, "hold_not_found", ErrHoldNotFound.Error()},
 		{"confirmed hold", "1", "1", HoldStatusConfirmed, "1", false, 409, "hold_already_confirmed", ErrHoldAlreadyConfirmed.Error()},
@@ -438,9 +443,14 @@ func TestConfirmHoldHandler(t *testing.T) {
 			rr := httptest.NewRecorder()
 			mux.ServeHTTP(rr, req)
 			var body ErrorResponse
-			err = json.NewDecoder(rr.Body).Decode(&body)
+			decoder := json.NewDecoder(rr.Body)
+			err = decoder.Decode(&body)
 			if err != nil {
 				t.Fatalf("failed to decode error response: %v", err)
+			}
+			err = decoder.Decode(&body)
+			if err != io.EOF {
+				t.Errorf("expected one JSON response, but also got %v", err)
 			}
 			status := rr.Code
 			contentTypeHeader := rr.Header().Get("Content-Type")

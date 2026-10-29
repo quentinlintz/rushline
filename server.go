@@ -103,6 +103,13 @@ func (s *Server) ConfirmHoldHandler(w http.ResponseWriter, r *http.Request) {
 	holdId := r.PathValue("holdId")
 	operationKey := r.Header.Get("operation-key")
 
+	if len(operationKey) == 0 {
+		if err := writeJSONError(w, ErrOperationKeyRequired.Error(), "operation_key_required", 400); err != nil {
+			slog.Error("failed to write JSON response", "error", err, "path", r.URL.Path)
+		}
+		return
+	}
+
 	event, ok := s.events[eventId]
 
 	if !ok {

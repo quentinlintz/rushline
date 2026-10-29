@@ -367,4 +367,58 @@ func TestRepository(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, holdTwo, operationTwo)
 	})
+
+	t.Run("confirm hold empty operation key", func(t *testing.T) {
+		now := time.Now().Truncate(time.Microsecond)
+		deadline := now.Add(time.Minute * 30)
+		operationKey := ""
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancel()
+
+		repo := setupTestcontainer(t, ctx)
+		event, err := repo.CreateEvent(ctx, &Event{
+			id:                 "1",
+			capacity:           10,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		})
+		require.NoError(t, err)
+
+		tests := []struct {
+			name        string
+			holdId      string
+			status      HoldStatus
+			currentTime time.Time
+		}{
+			{"active hold", "1", HoldStatusActive, now},
+			{"confirmed hold", "2", HoldStatusConfirmed, now},
+			{"cancelled hold", "3", HoldStatusCancelled, now},
+			{"overdue hold", "4", HoldStatusActive, deadline},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				hold, err := repo.CreateHold(ctx, Hold{
+					id:       tt.holdId,
+					status:   tt.status,
+					quantity: 3,
+					deadline: deadline,
+				}, event.id)
+				require.NoError(t, err)
+
+				_, err = repo.ConfirmHold(ctx, hold.id, operationKey, event.id, tt.currentTime)
+				assert.ErrorIs(t, err, ErrOperationKeyRequired)
+
+				storedHold, err := repo.ReadHold(ctx, hold.id, event.id)
+				assert.NoError(t, err)
+				assert.Equal(t, hold, storedHold)
+			})
+		}
+
+		t.Run("nonexistent hold", func(t *testing.T) {
+			_, err = repo.ConfirmHold(ctx, "123", operationKey, event.id, now)
+			assert.ErrorIs(t, err, ErrOperationKeyRequired)
+		})
+	})
 }

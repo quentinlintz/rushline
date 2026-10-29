@@ -95,6 +95,10 @@ func (e *Event) confirmHold(id string, currentTime time.Time, key string) (Hold,
 }
 
 func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) (Hold, error) {
+	if len(key) == 0 {
+		return Hold{}, ErrOperationKeyRequired
+	}
+
 	opHold, opFound := e.operations[key]
 	if opFound {
 		if opHold.id != id {
@@ -107,10 +111,6 @@ func (e *Event) confirmHoldLocked(id string, currentTime time.Time, key string) 
 
 	if !ok {
 		return Hold{}, ErrHoldNotFound
-	}
-
-	if len(key) == 0 {
-		return Hold{}, ErrOperationKeyRequired
 	}
 
 	switch hold.status {

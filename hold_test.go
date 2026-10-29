@@ -407,7 +407,7 @@ func TestConfirmHold(t *testing.T) {
 		hold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
 		operationsBefore := maps.Clone(event.operations)
-		_, err := event.confirmHold("1", now, "")
+		_, err := event.confirmHold("2", now, "")
 		if err == nil {
 			t.Fatal("expected error when confirming with empty key")
 		}

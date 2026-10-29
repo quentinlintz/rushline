@@ -68,6 +68,10 @@ func (r Repository) ReadOperation(ctx context.Context, id string, holdId string,
 }
 
 func (r Repository) ConfirmHold(ctx context.Context, id string, operationKey string, eventId string, currentTime time.Time) (Hold, error) {
+	if len(operationKey) == 0 {
+		return Hold{}, ErrOperationKeyRequired
+	}
+
 	var hold Hold
 	var eventConfirmationCutoff time.Time
 	status := HoldStatusConfirmed
