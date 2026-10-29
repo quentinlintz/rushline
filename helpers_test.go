@@ -1,8 +1,15 @@
 package rushline
 
 import (
+	"context"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 type holdResult struct {
@@ -63,4 +70,53 @@ func assertExpirableHoldMembership(t *testing.T, e *Event) {
 			t.Errorf("expected expirableHold entry with id '%v' to be in holds map", id)
 		}
 	}
+}
+
+func setupTestcontainer(t *testing.T, ctx context.Context) *Repository {
+	pgContainer, err := postgres.Run(ctx,
+		"postgres:18",
+		postgres.WithInitScripts(filepath.Join(".", "migrations", "000001_create_initial_schema.sql")),
+		postgres.WithDatabase("rushline"),
+		postgres.WithUsername("postgres"),
+		postgres.WithPassword("mysecretpass"),
+		testcontainers.WithWaitStrategyAndDeadline(
+			time.Minute,
+			wait.ForLog("database system is ready to accept connections").
+				WithOccurrence(2).WithStartupTimeout(5*time.Second)),
+	)
+	if pgContainer == nil {
+		t.Fatalf("pgContainer is nil: %s", err)
+	}
+	if err != nil {
+		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancelCleanup()
+		if termErr := pgContainer.Terminate(cleanupCtx); termErr != nil {
+			t.Errorf("failed to terminate pgContainer: %s", termErr)
+		}
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() {
+		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancelCleanup()
+		if err := pgContainer.Terminate(cleanupCtx); err != nil {
+			t.Fatalf("failed to terminate pgContainer: %s", err)
+		}
+	})
+
+	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
+	require.NoError(t, err)
+
+	repo, err := NewRepository(ctx, connStr)
+	require.NoError(t, err)
+
+	t.Cleanup(func() {
+		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancelCleanup()
+		if err := repo.conn.Close(cleanupCtx); err != nil {
+			t.Fatalf("failed to close connection: %s", err)
+		}
+	})
+
+	return repo
 }
