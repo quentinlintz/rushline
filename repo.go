@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -66,17 +67,19 @@ func (r Repository) ReadOperation(ctx context.Context, id string, holdId string,
 	return hold, nil
 }
 
-func (r Repository) ConfirmHold(ctx context.Context, id string, operationKey string, eventId string) (Hold, error) {
+func (r Repository) ConfirmHold(ctx context.Context, id string, operationKey string, eventId string, currentTime time.Time) (Hold, error) {
 	var hold Hold
+	var eventConfirmationCutoff time.Time
+	status := HoldStatusConfirmed
 	tx, err := r.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return Hold{}, err
 	}
 	defer tx.Rollback(ctx)
 
-	_, err = tx.Exec(ctx,
-		"SELECT 1 FROM events WHERE id = $1 FOR UPDATE",
-		eventId)
+	err = tx.QueryRow(ctx,
+		"SELECT confirmation_cutoff FROM events WHERE id = $1 FOR UPDATE",
+		eventId).Scan(&eventConfirmationCutoff)
 	if err != nil {
 		return Hold{}, err
 	}
@@ -106,23 +109,36 @@ func (r Repository) ConfirmHold(ctx context.Context, id string, operationKey str
 		return Hold{}, ErrHoldConfirmExpired
 	}
 
+	if currentTime.After(hold.deadline) ||
+		currentTime.Equal(hold.deadline) ||
+		currentTime.After(eventConfirmationCutoff) ||
+		currentTime.Equal(eventConfirmationCutoff) {
+		status = HoldStatusExpired
+	}
+
 	err = tx.QueryRow(ctx,
 		"UPDATE holds SET status = $1 WHERE id = $2 AND event_id = $3 RETURNING id, status, quantity, deadline",
-		HoldStatusConfirmed, id, eventId).Scan(&hold.id, &hold.status, &hold.quantity, &hold.deadline)
+		status, id, eventId).Scan(&hold.id, &hold.status, &hold.quantity, &hold.deadline)
 	if err != nil {
 		return Hold{}, err
 	}
 
-	_, err = tx.Exec(ctx,
-		"INSERT INTO operations (id, status, quantity, deadline, event_id, hold_id) VALUES ($1, $2, $3, $4, $5, $6)",
-		operationKey, HoldStatusConfirmed, hold.quantity, hold.deadline, eventId, hold.id)
-	if err != nil {
-		return Hold{}, err
+	if status == HoldStatusConfirmed {
+		_, err = tx.Exec(ctx,
+			"INSERT INTO operations (id, status, quantity, deadline, event_id, hold_id) VALUES ($1, $2, $3, $4, $5, $6)",
+			operationKey, HoldStatusConfirmed, hold.quantity, hold.deadline, eventId, hold.id)
+		if err != nil {
+			return Hold{}, err
+		}
 	}
 
 	if err = tx.Commit(ctx); err != nil {
 		return Hold{}, err
 	}
 
-	return hold, nil
+	if status == HoldStatusExpired {
+		return Hold{}, ErrAfterConfirmationDeadline
+	} else {
+		return hold, nil
+	}
 }
