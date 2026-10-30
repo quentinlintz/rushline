@@ -2,12 +2,15 @@ package rushline
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
+
+var ErrEventNotFound = errors.New("event not found")
 
 type Repository struct {
 	conn *pgx.Conn
@@ -85,6 +88,9 @@ func (r Repository) ConfirmHold(ctx context.Context, id string, operationKey str
 		"SELECT confirmation_cutoff FROM events WHERE id = $1 FOR UPDATE",
 		eventId).Scan(&eventConfirmationCutoff)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return Hold{}, ErrEventNotFound
+		}
 		return Hold{}, err
 	}
 
@@ -104,6 +110,9 @@ func (r Repository) ConfirmHold(ctx context.Context, id string, operationKey str
 		"SELECT id, status, quantity, deadline, event_id FROM holds WHERE id = $1 AND event_id = $2",
 		id, eventId).Scan(&hold.id, &hold.status, &hold.quantity, &hold.deadline, nil)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			return Hold{}, ErrHoldNotFound
+		}
 		return Hold{}, err
 	}
 

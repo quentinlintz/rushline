@@ -421,4 +421,66 @@ func TestRepository(t *testing.T) {
 			assert.ErrorIs(t, err, ErrOperationKeyRequired)
 		})
 	})
+
+	t.Run("confirm hold resource not found", func(t *testing.T) {
+		now := time.Now().Truncate(time.Microsecond)
+		deadline := now.Add(time.Minute * 30)
+		operationKey := "123"
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancel()
+
+		repo := setupTestcontainer(t, ctx)
+		eventOne, err := repo.CreateEvent(ctx, &Event{
+			id:                 "1",
+			capacity:           1,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		})
+		require.NoError(t, err)
+		_, err = repo.CreateEvent(ctx, &Event{
+			id:                 "2",
+			capacity:           1,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		})
+		require.NoError(t, err)
+		hold, err := repo.CreateHold(ctx, Hold{
+			id:       "1",
+			status:   HoldStatusActive,
+			quantity: 1,
+			deadline: deadline,
+		}, eventOne.id)
+		require.NoError(t, err)
+
+		tests := []struct {
+			name      string
+			eventId   string
+			holdId    string
+			expectErr error
+		}{
+			{"missing hold", "1", "2", ErrHoldNotFound},
+			{"missing event", "3", "2", ErrEventNotFound},
+			{"hold part of another event", "2", "1", ErrHoldNotFound},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err = repo.ConfirmHold(ctx, tt.holdId, operationKey, tt.eventId, now)
+				assert.ErrorIs(t, err, tt.expectErr)
+
+				storedHold, err := repo.ReadHold(ctx, hold.id, eventOne.id)
+				assert.NoError(t, err)
+				assert.Equal(t, hold, storedHold)
+
+				_, err = repo.ReadOperation(ctx, operationKey, tt.holdId, tt.eventId)
+				assert.ErrorIs(t, err, pgx.ErrNoRows)
+				_, err = repo.ReadOperation(ctx, operationKey, "1", "1")
+				assert.ErrorIs(t, err, pgx.ErrNoRows)
+				_, err = repo.ReadOperation(ctx, operationKey, "1", "2")
+				assert.ErrorIs(t, err, pgx.ErrNoRows)
+			})
+		}
+	})
 }
