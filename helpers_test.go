@@ -72,7 +72,8 @@ func assertExpirableHoldMembership(t *testing.T, e *Event) {
 	}
 }
 
-func setupTestcontainer(t *testing.T, ctx context.Context) *Repository {
+func setupContainer(t *testing.T, ctx context.Context) string {
+	t.Helper()
 	pgContainer, err := postgres.Run(ctx,
 		"postgres:18",
 		postgres.WithInitScripts(filepath.Join(".", "migrations", "000001_create_initial_schema.sql")),
@@ -107,6 +108,11 @@ func setupTestcontainer(t *testing.T, ctx context.Context) *Repository {
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 	require.NoError(t, err)
 
+	return connStr
+}
+
+func setupRepository(t *testing.T, ctx context.Context, connStr string) *Repository {
+	t.Helper()
 	repo, err := NewRepository(ctx, connStr)
 	require.NoError(t, err)
 
@@ -119,4 +125,10 @@ func setupTestcontainer(t *testing.T, ctx context.Context) *Repository {
 	})
 
 	return repo
+}
+
+func setupTestcontainer(t *testing.T, ctx context.Context) *Repository {
+	t.Helper()
+	connStr := setupContainer(t, ctx)
+	return setupRepository(t, ctx, connStr)
 }

@@ -478,9 +478,102 @@ func TestRepository(t *testing.T) {
 				assert.ErrorIs(t, err, pgx.ErrNoRows)
 				_, err = repo.ReadOperation(ctx, operationKey, "1", "1")
 				assert.ErrorIs(t, err, pgx.ErrNoRows)
-				_, err = repo.ReadOperation(ctx, operationKey, "1", "2")
+				_, err = repo.ReadOperation(ctx, operationKey, "1", tt.eventId)
 				assert.ErrorIs(t, err, pgx.ErrNoRows)
 			})
 		}
+	})
+
+	t.Run("confirm hold concurrent", func(t *testing.T) {
+		holdChan := make(chan holdResult, 2)
+		now := time.Now().Truncate(time.Microsecond)
+		deadline := now.Add(time.Minute * 30)
+		operationKey := "123"
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancel()
+
+		connStr := setupContainer(t, ctx)
+		repoOne := setupRepository(t, ctx, connStr)
+		repoTwo := setupRepository(t, ctx, connStr)
+		repoThree := setupRepository(t, ctx, connStr)
+		event, err := repoOne.CreateEvent(ctx, &Event{
+			id:                 "1",
+			capacity:           1,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		})
+		require.NoError(t, err)
+		hold, err := repoOne.CreateHold(ctx, Hold{
+			id:       "1",
+			status:   HoldStatusActive,
+			quantity: 1,
+			deadline: deadline,
+		}, event.id)
+		require.NoError(t, err)
+
+		var pidOne int
+		var pidTwo int
+		err = repoOne.conn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidOne)
+		require.NoError(t, err)
+		err = repoTwo.conn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidTwo)
+		require.NoError(t, err)
+		tx, err := repoThree.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		err = tx.QueryRow(ctx,
+			"SELECT id FROM events WHERE id = $1 FOR UPDATE",
+			event.id).Scan(nil)
+		require.NoError(t, err)
+
+		go func() {
+			updatedHold, err := repoOne.ConfirmHold(ctx, hold.id, operationKey, event.id, now)
+			holdChan <- holdResult{updatedHold, err}
+		}()
+		go func() {
+			updatedHold, err := repoTwo.ConfirmHold(ctx, hold.id, operationKey, event.id, now)
+			holdChan <- holdResult{updatedHold, err}
+		}()
+
+		ticker := time.NewTicker(time.Millisecond * 10)
+		defer ticker.Stop()
+		for range ticker.C {
+			var blockingPidsOne []int64
+			var blockingPidsTwo []int64
+			err = tx.QueryRow(ctx, "SELECT pg_blocking_pids($1)", pidOne).Scan(&blockingPidsOne)
+			require.NoError(t, err)
+			err = tx.QueryRow(ctx, "SELECT pg_blocking_pids($1)", pidTwo).Scan(&blockingPidsTwo)
+			require.NoError(t, err)
+			if len(blockingPidsOne) != 0 && len(blockingPidsTwo) != 0 {
+				break
+			}
+		}
+		err = tx.Rollback(ctx)
+		require.NoError(t, err)
+
+		var updatedHold Hold
+		for range 2 {
+			result := <-holdChan
+			updatedHold, err = result.hold, result.err
+			assert.NoError(t, err)
+			assert.Equal(t, hold.id, updatedHold.id)
+			assert.Equal(t, HoldStatusConfirmed, updatedHold.status)
+			assert.Equal(t, hold.quantity, updatedHold.quantity)
+			assert.Equal(t, hold.deadline, updatedHold.deadline)
+		}
+
+		storedHold, err := repoOne.ReadHold(ctx, hold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, updatedHold, storedHold)
+
+		operation, err := repoOne.ReadOperation(ctx, operationKey, hold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, updatedHold, operation)
+
+		var operationCount int
+		err = repoOne.conn.QueryRow(ctx,
+			"SELECT COUNT(*) FROM operations").Scan(&operationCount)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, operationCount)
 	})
 }
