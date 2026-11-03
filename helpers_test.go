@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -72,7 +73,7 @@ func assertExpirableHoldMembership(t *testing.T, e *Event) {
 	}
 }
 
-func setupContainer(t *testing.T, ctx context.Context) string {
+func setupContainer(t *testing.T, ctx context.Context) (string, *postgres.PostgresContainer) {
 	t.Helper()
 	pgContainer, err := postgres.Run(ctx,
 		"postgres:18",
@@ -108,7 +109,7 @@ func setupContainer(t *testing.T, ctx context.Context) string {
 	connStr, err := pgContainer.ConnectionString(ctx, "sslmode=disable")
 	require.NoError(t, err)
 
-	return connStr
+	return connStr, pgContainer
 }
 
 func setupRepository(t *testing.T, ctx context.Context, connStr string) *Repository {
@@ -127,8 +128,45 @@ func setupRepository(t *testing.T, ctx context.Context, connStr string) *Reposit
 	return repo
 }
 
-func setupTestcontainer(t *testing.T, ctx context.Context) *Repository {
+func setupTestcontainer(t *testing.T, ctx context.Context) (*Repository, *postgres.PostgresContainer) {
 	t.Helper()
-	connStr := setupContainer(t, ctx)
-	return setupRepository(t, ctx, connStr)
+	connStr, pgContainer := setupContainer(t, ctx)
+	return setupRepository(t, ctx, connStr), pgContainer
+}
+
+func reconnectTestcontainer(t *testing.T, ctx context.Context, connStr string) *Repository {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	var conn *pgx.Conn
+	var err error
+	for range ticker.C {
+		if ctx.Err() != nil {
+			require.Fail(t, "failed to reconnect to db in time")
+		}
+		conn, err = pgx.Connect(ctx, connStr)
+		if err != nil {
+			continue
+		}
+		if conn.Ping(ctx) == nil {
+			break
+		}
+		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		if err := conn.Close(cleanupCtx); err != nil {
+			t.Fatalf("failed to close connection: %s", err)
+		}
+		cancelCleanup()
+	}
+
+	t.Cleanup(func() {
+		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancelCleanup()
+		if err := conn.Close(cleanupCtx); err != nil {
+			t.Fatalf("failed to close connection: %s", err)
+		}
+	})
+
+	return &Repository{
+		conn: conn,
+	}
 }

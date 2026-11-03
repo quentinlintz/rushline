@@ -25,7 +25,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 
 		eventOne, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
@@ -81,7 +81,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		event, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           1,
@@ -121,7 +121,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		event, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           1,
@@ -160,7 +160,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		event, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           1,
@@ -211,7 +211,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		event, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           1,
@@ -267,7 +267,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		event, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           2,
@@ -330,7 +330,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		eventOne, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           4,
@@ -382,7 +382,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		event, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           10,
@@ -436,7 +436,7 @@ func TestRepository(t *testing.T) {
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 		defer cancel()
 
-		repo := setupTestcontainer(t, ctx)
+		repo, _ := setupTestcontainer(t, ctx)
 		eventOne, err := repo.CreateEvent(ctx, &Event{
 			id:                 "1",
 			capacity:           1,
@@ -510,7 +510,7 @@ func TestRepository(t *testing.T) {
 			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 			defer cancel()
 
-			connStr := setupContainer(t, ctx)
+			connStr, _ := setupContainer(t, ctx)
 			repoOne := setupRepository(t, ctx, connStr)
 			repoTwo := setupRepository(t, ctx, connStr)
 			repoThree := setupRepository(t, ctx, connStr)
@@ -655,4 +655,74 @@ func TestRepository(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("confirm replay after postgres restart", func(t *testing.T) {
+		now := time.Now().Truncate(time.Microsecond)
+		deadline := now.Add(time.Minute * 30)
+		operationKey := "123"
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
+		defer cancel()
+
+		repo, pgContainer := setupTestcontainer(t, ctx)
+		event, err := repo.CreateEvent(ctx, &Event{
+			id:                 "1",
+			capacity:           1,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		})
+		require.NoError(t, err)
+		hold, err := repo.CreateHold(ctx, Hold{
+			id:       "1",
+			status:   HoldStatusActive,
+			quantity: 1,
+			deadline: deadline,
+		}, event.id)
+		require.NoError(t, err)
+
+		updatedHold, err := repo.ConfirmHold(ctx, hold.id, operationKey, event.id, now)
+		assert.NoError(t, err)
+		assert.Equal(t, hold.id, updatedHold.id)
+		assert.Equal(t, HoldStatusConfirmed, updatedHold.status)
+		assert.Equal(t, hold.quantity, updatedHold.quantity)
+		assert.Equal(t, hold.deadline, updatedHold.deadline)
+
+		restartCtx, cancelReadiness := context.WithDeadline(context.Background(), time.Now().Add(20*time.Second))
+		defer cancelReadiness()
+
+		timeout := time.Minute
+		err = pgContainer.Stop(restartCtx, &timeout)
+		require.NoError(t, err)
+		err = pgContainer.Start(restartCtx)
+		require.NoError(t, err)
+
+		connStr, err := pgContainer.ConnectionString(restartCtx, "sslmode=disable")
+		require.NoError(t, err)
+		newRepo := reconnectTestcontainer(t, restartCtx, connStr)
+
+		newRepoCtx, cancelNewRepoCtx := context.WithDeadline(context.Background(), time.Now().Add(5*time.Second))
+		defer cancelNewRepoCtx()
+
+		storedHold, err := newRepo.ReadHold(newRepoCtx, hold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, updatedHold, storedHold)
+
+		operation, err := newRepo.ReadOperation(newRepoCtx, operationKey, updatedHold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, updatedHold, operation)
+
+		retriedHold, err := newRepo.ConfirmHold(newRepoCtx, hold.id, operationKey, event.id, deadline)
+		assert.NoError(t, err)
+		assert.Equal(t, updatedHold, retriedHold)
+
+		retriedHold, err = newRepo.ConfirmHold(newRepoCtx, hold.id, operationKey, event.id, event.confirmationCutoff.Add(time.Second))
+		assert.NoError(t, err)
+		assert.Equal(t, updatedHold, retriedHold)
+
+		var operationCount int
+		err = newRepo.conn.QueryRow(newRepoCtx,
+			"SELECT COUNT(*) FROM operations").Scan(&operationCount)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, operationCount)
+	})
 }
