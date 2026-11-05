@@ -1,6 +1,7 @@
 package rushline
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -8,10 +9,28 @@ import (
 	"time"
 )
 
-// TODO: Temporary struct, will be replaced by a db
 type Server struct {
+	clock     Clock
+	confirmer HoldConfirmer
+}
+
+type HoldConfirmer interface {
+	ConfirmHold(ctx context.Context, id string, operationKey string, eventId string, currentTime time.Time) (Hold, error)
+}
+
+type Memory struct {
 	events map[string]*Event
-	clock  Clock
+}
+
+func (m Memory) ConfirmHold(ctx context.Context, id string, operationKey string, eventId string, currentTime time.Time) (Hold, error) {
+	if operationKey == "" {
+		return Hold{}, ErrOperationKeyRequired
+	}
+	event, exists := m.events[eventId]
+	if !exists {
+		return Hold{}, ErrEventNotFound
+	}
+	return event.confirmHold(id, currentTime, operationKey)
 }
 
 type HoldResponse struct {
@@ -30,18 +49,13 @@ type ErrorResponse struct {
 	Code    string `json:"code"`
 }
 
-func initServer(clock Clock) (*Server, error) {
+func initServer(clock Clock, confirmer HoldConfirmer) (*Server, error) {
 	newServer := &Server{
-		events: make(map[string]*Event),
-		clock:  clock,
+		clock:     clock,
+		confirmer: confirmer,
 	}
 
 	return newServer, nil
-}
-
-// TODO: Temporary method, will be replaced by an HTTP handler
-func (s *Server) addEvent(event *Event) {
-	s.events[event.id] = event
 }
 
 func writeJSONSuccess(w http.ResponseWriter, hold Hold) error {
@@ -110,21 +124,18 @@ func (s *Server) ConfirmHoldHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	event, ok := s.events[eventId]
+	ctx, close := context.WithTimeout(r.Context(), 5*time.Second)
+	defer close()
 
-	if !ok {
-		if err := writeJSONError(w, "event does not exist", "event_not_found", http.StatusNotFound); err != nil {
-			slog.Error("failed to write JSON response", "error", err, "path", r.URL.Path)
-		}
-		return
-	}
-
-	hold, err := event.confirmHold(holdId, s.clock.Now(), operationKey)
+	hold, err := s.confirmer.ConfirmHold(ctx, holdId, operationKey, eventId, s.clock.Now())
 	if err != nil {
 		var code string
 		var status int
 		if errors.Is(err, ErrHoldNotFound) {
 			code = "hold_not_found"
+			status = 404
+		} else if errors.Is(err, ErrEventNotFound) {
+			code = "event_not_found"
 			status = 404
 		} else if errors.Is(err, ErrHoldAlreadyConfirmed) {
 			code = "hold_already_confirmed"

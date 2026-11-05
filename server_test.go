@@ -1,6 +1,7 @@
 package rushline
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -8,10 +9,13 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestConfirmHoldHandler(t *testing.T) {
-	t.Run("confirmation and retry succeed", func(t *testing.T) {
+	t.Run("memory confirmation and retry succeed", func(t *testing.T) {
 		clock := MockClock{
 			StaticTime: now,
 		}
@@ -19,11 +23,14 @@ func TestConfirmHoldHandler(t *testing.T) {
 		expectedHold := setupHold(t, event, now)
 		expectedHold.status = HoldStatusConfirmed
 		availabilityStart := event.getAvailability()
-		server, err := initServer(&clock)
+		memory := Memory{
+			events: make(map[string]*Event),
+		}
+		memory.events[event.id] = event
+		server, err := initServer(&clock, memory)
 		if err != nil {
 			t.Fatalf("failed to init server, %v", err.Error())
 		}
-		server.addEvent(event)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
@@ -113,6 +120,97 @@ func TestConfirmHoldHandler(t *testing.T) {
 		}
 	})
 
+	t.Run("repository confirmation and retry succeed", func(t *testing.T) {
+		now := time.Now().Truncate(time.Microsecond)
+		deadline := now.Add(time.Minute * 30)
+		clock := MockClock{
+			StaticTime: now,
+		}
+		event := &Event{
+			id:                 "1",
+			capacity:           2,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		}
+		hold := Hold{
+			id:       "1",
+			status:   HoldStatusActive,
+			quantity: 1,
+			deadline: deadline,
+		}
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancel()
+		repo, _ := setupTestcontainer(t, ctx)
+		_, err := repo.CreateEvent(ctx, event)
+		require.NoError(t, err)
+		_, err = repo.CreateHold(ctx, hold, event.id)
+		require.NoError(t, err)
+		server, err := initServer(&clock, repo)
+		require.NoError(t, err)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
+		req := httptest.NewRequest(http.MethodPost, "/events/1/holds/1/confirm", nil)
+		req.Header.Set("operation-key", "1")
+		rr := httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		var body SuccessResponse
+		err = json.NewDecoder(rr.Body).Decode(&body)
+		require.NoError(t, err)
+		status := rr.Code
+		contentTypeHeader := rr.Header().Get("Content-Type")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "application/json; charset=utf-8", contentTypeHeader)
+
+		assert.Equal(t, hold.id, body.Hold.ID)
+		assert.Equal(t, "confirmed", body.Hold.Status)
+		assert.Equal(t, hold.quantity, body.Hold.Quantity)
+		assert.Equal(t, hold.deadline, body.Hold.Deadline)
+
+		storedHold, err := repo.ReadHold(ctx, hold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, hold.id, storedHold.id)
+		assert.Equal(t, HoldStatusConfirmed, storedHold.status)
+		assert.Equal(t, hold.quantity, storedHold.quantity)
+		assert.Equal(t, hold.deadline, storedHold.deadline)
+
+		clock.StaticTime = now.Add(3 * time.Hour)
+		req = httptest.NewRequest(http.MethodPost, "/events/1/holds/1/confirm", nil)
+		req.Header.Set("operation-key", "1")
+		rr = httptest.NewRecorder()
+		mux.ServeHTTP(rr, req)
+		var retryBody SuccessResponse
+		err = json.NewDecoder(rr.Body).Decode(&retryBody)
+		require.NoError(t, err)
+		status = rr.Code
+		contentTypeHeader = rr.Header().Get("Content-Type")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "application/json; charset=utf-8", contentTypeHeader)
+
+		assert.Equal(t, hold.id, retryBody.Hold.ID)
+		assert.Equal(t, "confirmed", retryBody.Hold.Status)
+		assert.Equal(t, hold.quantity, retryBody.Hold.Quantity)
+		assert.Equal(t, hold.deadline, retryBody.Hold.Deadline)
+
+		storedHold, err = repo.ReadHold(ctx, hold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, hold.id, storedHold.id)
+		assert.Equal(t, HoldStatusConfirmed, storedHold.status)
+		assert.Equal(t, hold.quantity, storedHold.quantity)
+		assert.Equal(t, hold.deadline, storedHold.deadline)
+
+		operation, err := repo.ReadOperation(ctx, "1", storedHold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, storedHold, operation)
+
+		var operationCount int
+		err = repo.pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM operations").Scan(&operationCount)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, operationCount)
+	})
+
 	t.Run("unexpected error", func(t *testing.T) {
 		clock := MockClock{
 			StaticTime: now,
@@ -122,11 +220,14 @@ func TestConfirmHoldHandler(t *testing.T) {
 		expectedHold.status = HoldStatusInvalid
 		event.holds[expectedHold.id] = expectedHold
 		availabilityStart := event.getAvailability()
-		server, err := initServer(&clock)
+		memory := Memory{
+			events: make(map[string]*Event),
+		}
+		memory.events[event.id] = event
+		server, err := initServer(&clock, memory)
 		if err != nil {
 			t.Fatalf("failed to init server, %v", err.Error())
 		}
-		server.addEvent(event)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
@@ -174,11 +275,14 @@ func TestConfirmHoldHandler(t *testing.T) {
 		event := setupEvent(t, now, 1)
 		expectedHold := setupHold(t, event, now)
 		availabilityStart := event.getAvailability()
-		server, err := initServer(&clock)
+		memory := Memory{
+			events: make(map[string]*Event),
+		}
+		memory.events[event.id] = event
+		server, err := initServer(&clock, memory)
 		if err != nil {
 			t.Fatalf("failed to init server, %v", err.Error())
 		}
-		server.addEvent(event)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
@@ -231,11 +335,14 @@ func TestConfirmHoldHandler(t *testing.T) {
 		expectedHold := setupHold(t, event, now)
 		expectedHold.status = HoldStatusExpired
 		availabilityStart := event.getAvailability()
-		server, err := initServer(&clock)
+		memory := Memory{
+			events: make(map[string]*Event),
+		}
+		memory.events[event.id] = event
+		server, err := initServer(&clock, memory)
 		if err != nil {
 			t.Fatalf("failed to init server, %v", err.Error())
 		}
-		server.addEvent(event)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
@@ -291,11 +398,14 @@ func TestConfirmHoldHandler(t *testing.T) {
 			t.Fatalf("failed to create hold, %v", err.Error())
 		}
 		availabilityStart := event.getAvailability()
-		server, err := initServer(&clock)
+		memory := Memory{
+			events: make(map[string]*Event),
+		}
+		memory.events[event.id] = event
+		server, err := initServer(&clock, memory)
 		if err != nil {
 			t.Fatalf("failed to init server, %v", err.Error())
 		}
-		server.addEvent(event)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
@@ -403,7 +513,7 @@ func TestConfirmHoldHandler(t *testing.T) {
 		{"operation key empty header, event not found", "0", "1", HoldStatusActive, "", false, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
 		{"operation key missing header, hold not found", "1", "0", HoldStatusActive, "", true, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
 		{"operation key empty header, hold not found", "1", "0", HoldStatusActive, "", false, 400, "operation_key_required", ErrOperationKeyRequired.Error()},
-		{"event not found", "2", "1", HoldStatusActive, "1", false, 404, "event_not_found", "event does not exist"},
+		{"event not found", "2", "1", HoldStatusActive, "1", false, 404, "event_not_found", "event not found"},
 		{"hold not found", "1", "0", HoldStatusActive, "1", false, 404, "hold_not_found", ErrHoldNotFound.Error()},
 		{"confirmed hold", "1", "1", HoldStatusConfirmed, "1", false, 409, "hold_already_confirmed", ErrHoldAlreadyConfirmed.Error()},
 		{"cancelled hold", "1", "1", HoldStatusCancelled, "1", false, 409, "hold_cancelled", ErrHoldAlreadyCancelled.Error()},
@@ -428,11 +538,14 @@ func TestConfirmHoldHandler(t *testing.T) {
 			}
 			event.holds[expectedHold.id] = expectedHold
 			availabilityStart := event.getAvailability()
-			server, err := initServer(&clock)
+			memory := Memory{
+				events: make(map[string]*Event),
+			}
+			memory.events[event.id] = event
+			server, err := initServer(&clock, memory)
 			if err != nil {
 				t.Fatalf("failed to init server, %v", err.Error())
 			}
-			server.addEvent(event)
 
 			mux := http.NewServeMux()
 			mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
@@ -492,11 +605,14 @@ func TestConfirmHoldHandlerConcurrent(t *testing.T) {
 		expectedHold := setupHold(t, event, now)
 		expectedHold.status = HoldStatusConfirmed
 		availabilityStart := event.getAvailability()
-		server, err := initServer(&clock)
+		memory := Memory{
+			events: make(map[string]*Event),
+		}
+		memory.events[event.id] = event
+		server, err := initServer(&clock, memory)
 		if err != nil {
 			t.Fatalf("failed to init server, %v", err.Error())
 		}
-		server.addEvent(event)
 
 		mux := http.NewServeMux()
 		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
