@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -18,7 +19,54 @@ type holdResult struct {
 	err  error
 }
 
+type AcquireEvent struct {
+	Worker string
+	PID    uint32
+	Err    error
+}
+
 var now = time.Unix(1781622600, 0)
+
+type ConnectionAcquireTracer struct {
+	EventChan chan<- AcquireEvent
+}
+
+func (t *ConnectionAcquireTracer) TraceAcquireStart(ctx context.Context, pool *pgxpool.Pool, data pgxpool.TraceAcquireStartData) context.Context {
+	return ctx
+}
+
+func (t *ConnectionAcquireTracer) TraceAcquireEnd(ctx context.Context, pool *pgxpool.Pool, data pgxpool.TraceAcquireEndData) {
+	val := ctx.Value(workerKey)
+	if val == nil {
+		return
+	}
+
+	worker, ok := val.(string)
+	if !ok {
+		return
+	}
+
+	if data.Err != nil {
+		t.EventChan <- AcquireEvent{
+			Worker: worker,
+			PID:    0,
+			Err:    data.Err,
+		}
+	} else {
+		t.EventChan <- AcquireEvent{
+			Worker: worker,
+			PID:    data.Conn.PgConn().PID(),
+			Err:    nil,
+		}
+	}
+}
+
+func (t *ConnectionAcquireTracer) TraceQueryStart(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	return ctx
+}
+
+func (t *ConnectionAcquireTracer) TraceQueryEnd(ctx context.Context, conn *pgx.Conn, data pgx.TraceQueryEndData) {
+}
 
 func setupEvent(tb testing.TB, now time.Time, capacity int) *Event {
 	tb.Helper()
@@ -112,17 +160,47 @@ func setupContainer(t *testing.T, ctx context.Context) (string, *postgres.Postgr
 	return connStr, pgContainer
 }
 
+func setupRepositoryWithObserver(t *testing.T, ctx context.Context, connStr string, eventChan chan<- AcquireEvent) *Repository {
+	t.Helper()
+	config, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		require.NoError(t, err)
+	}
+
+	config.ConnConfig.Tracer = &ConnectionAcquireTracer{
+		EventChan: eventChan,
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, config)
+	if err != nil {
+		require.NoError(t, err)
+	}
+
+	connCtx, cancel := context.WithDeadline(ctx, time.Now().Add(time.Second*5))
+	defer cancel()
+
+	if err = pool.Ping(connCtx); err != nil {
+		pool.Close()
+		require.NoError(t, err)
+	}
+
+	repo := &Repository{
+		pool: pool,
+	}
+
+	t.Cleanup(func() {
+		repo.Close()
+	})
+
+	return repo
+}
+
 func setupRepository(t *testing.T, ctx context.Context, connStr string) *Repository {
 	t.Helper()
 	repo, err := NewRepository(ctx, connStr)
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
-		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
-		defer cancelCleanup()
-		if err := repo.conn.Close(cleanupCtx); err != nil {
-			t.Fatalf("failed to close connection: %s", err)
-		}
+		repo.Close()
 	})
 
 	return repo
@@ -138,35 +216,27 @@ func reconnectTestcontainer(t *testing.T, ctx context.Context, connStr string) *
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 
-	var conn *pgx.Conn
+	var pool *pgxpool.Pool
 	var err error
 	for range ticker.C {
 		if ctx.Err() != nil {
 			require.Fail(t, "failed to reconnect to db in time")
 		}
-		conn, err = pgx.Connect(ctx, connStr)
+		pool, err = pgxpool.New(ctx, connStr)
 		if err != nil {
 			continue
 		}
-		if conn.Ping(ctx) == nil {
+		if pool.Ping(ctx) == nil {
 			break
 		}
-		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
-		if err := conn.Close(cleanupCtx); err != nil {
-			t.Fatalf("failed to close connection: %s", err)
-		}
-		cancelCleanup()
+		pool.Close()
 	}
 
 	t.Cleanup(func() {
-		cleanupCtx, cancelCleanup := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
-		defer cancelCleanup()
-		if err := conn.Close(cleanupCtx); err != nil {
-			t.Fatalf("failed to close connection: %s", err)
-		}
+		pool.Close()
 	})
 
 	return &Repository{
-		conn: conn,
+		pool: pool,
 	}
 }

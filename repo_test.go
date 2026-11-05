@@ -18,6 +18,10 @@ type operationResult struct {
 	err          error
 }
 
+type contextKey string
+
+const workerKey contextKey = "worker"
+
 func TestRepository(t *testing.T) {
 	t.Run("read hold by event id and hold id", func(t *testing.T) {
 		now := time.Now().Truncate(time.Microsecond)
@@ -138,7 +142,7 @@ func TestRepository(t *testing.T) {
 		}, event.id)
 		require.NoError(t, err)
 
-		_, err = repo.conn.Exec(ctx, "ALTER TABLE operations ADD CONSTRAINT reject_key CHECK (id <> '123')")
+		_, err = repo.pool.Exec(ctx, "ALTER TABLE operations ADD CONSTRAINT reject_key CHECK (id <> '123')")
 		require.NoError(t, err)
 
 		_, err = repo.ConfirmHold(ctx, hold.id, operationKey, event.id, now)
@@ -505,16 +509,15 @@ func TestRepository(t *testing.T) {
 	for _, tt := range concurrentTests {
 		t.Run(tt.name, func(t *testing.T) {
 			holdChan := make(chan operationResult, 2)
+			eventChan := make(chan AcquireEvent, 2)
 			now := time.Now().Truncate(time.Microsecond)
 			deadline := now.Add(time.Minute * 30)
 			ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
 			defer cancel()
 
 			connStr, _ := setupContainer(t, ctx)
-			repoOne := setupRepository(t, ctx, connStr)
-			repoTwo := setupRepository(t, ctx, connStr)
-			repoThree := setupRepository(t, ctx, connStr)
-			event, err := repoOne.CreateEvent(ctx, &Event{
+			repo := setupRepositoryWithObserver(t, ctx, connStr, eventChan)
+			event, err := repo.CreateEvent(ctx, &Event{
 				id:                 "1",
 				capacity:           3,
 				onsaleOpening:      now.Add(time.Minute),
@@ -522,14 +525,14 @@ func TestRepository(t *testing.T) {
 				confirmationCutoff: now.Add(time.Hour * 2),
 			})
 			require.NoError(t, err)
-			hold, err := repoOne.CreateHold(ctx, Hold{
+			hold, err := repo.CreateHold(ctx, Hold{
 				id:       "1",
 				status:   HoldStatusActive,
 				quantity: 1,
 				deadline: deadline,
 			}, event.id)
 			require.NoError(t, err)
-			secondHold, err := repoOne.CreateHold(ctx, Hold{
+			secondHold, err := repo.CreateHold(ctx, Hold{
 				id:       "2",
 				status:   HoldStatusActive,
 				quantity: 2,
@@ -537,13 +540,7 @@ func TestRepository(t *testing.T) {
 			}, event.id)
 			require.NoError(t, err)
 
-			var pidOne int
-			var pidTwo int
-			err = repoOne.conn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidOne)
-			require.NoError(t, err)
-			err = repoTwo.conn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&pidTwo)
-			require.NoError(t, err)
-			tx, err := repoThree.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+			tx, err := repo.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 			require.NoError(t, err)
 			defer tx.Rollback(ctx)
 			err = tx.QueryRow(ctx,
@@ -551,14 +548,53 @@ func TestRepository(t *testing.T) {
 				event.id).Scan(nil)
 			require.NoError(t, err)
 
+			aCtx := context.WithValue(ctx, workerKey, "A")
+			bCtx := context.WithValue(ctx, workerKey, "B")
+
 			go func() {
-				updatedHold, err := repoOne.ConfirmHold(ctx, hold.id, tt.operationKeyOne, event.id, now)
+				updatedHold, err := repo.ConfirmHold(aCtx, hold.id, tt.operationKeyOne, event.id, now)
 				holdChan <- operationResult{updatedHold, hold.id, tt.operationKeyOne, err}
 			}()
 			go func() {
-				updatedHold, err := repoTwo.ConfirmHold(ctx, tt.secondHoldId, tt.operationKeyTwo, event.id, now)
+				updatedHold, err := repo.ConfirmHold(bCtx, tt.secondHoldId, tt.operationKeyTwo, event.id, now)
 				holdChan <- operationResult{updatedHold, tt.secondHoldId, tt.operationKeyTwo, err}
 			}()
+
+			var pidOne uint32
+			var pidTwo uint32
+			for range 2 {
+				select {
+				case data := <-eventChan:
+					require.NoError(t, data.Err)
+					switch data.Worker {
+					case "A":
+						if pidOne != 0 {
+							require.Fail(t, "received duplicate worker A")
+						}
+						pidOne = data.PID
+					case "B":
+						if pidTwo != 0 {
+							require.Fail(t, "received duplicate worker B")
+						}
+						pidTwo = data.PID
+					default:
+						require.Fail(t, "unknown worker label")
+					}
+				case <-ctx.Done():
+					require.Fail(t, "listening for events timed out")
+
+				}
+			}
+
+			if pidOne == 0 {
+				require.Fail(t, "pidOne is 0")
+			}
+			if pidTwo == 0 {
+				require.Fail(t, "pidTwo is 0")
+			}
+			if pidOne == pidTwo {
+				require.Fail(t, "pidOne matches pidTwo")
+			}
 
 			ticker := time.NewTicker(time.Millisecond * 10)
 			defer ticker.Stop()
@@ -625,7 +661,7 @@ func TestRepository(t *testing.T) {
 			}
 
 			var operationCount int
-			err = repoOne.conn.QueryRow(ctx,
+			err = repo.pool.QueryRow(ctx,
 				"SELECT COUNT(*) FROM operations").Scan(&operationCount)
 			assert.NoError(t, err)
 			assert.Equal(t, 1, operationCount)
@@ -637,20 +673,20 @@ func TestRepository(t *testing.T) {
 				} else {
 					losingHold = hold
 				}
-				storedHold, err := repoOne.ReadHold(ctx, losingHold.id, event.id)
+				storedHold, err := repo.ReadHold(ctx, losingHold.id, event.id)
 				assert.NoError(t, err)
 				assert.Equal(t, losingHold, storedHold)
 			}
-			storedHold, err := repoOne.ReadHold(ctx, updatedHold.id, event.id)
+			storedHold, err := repo.ReadHold(ctx, updatedHold.id, event.id)
 			assert.NoError(t, err)
 			assert.Equal(t, updatedHold, storedHold)
 
-			operation, err := repoOne.ReadOperation(ctx, successKey, updatedHold.id, event.id)
+			operation, err := repo.ReadOperation(ctx, successKey, updatedHold.id, event.id)
 			assert.NoError(t, err)
 			assert.Equal(t, updatedHold, operation)
 
 			if tt.operationKeyOne != tt.operationKeyTwo {
-				_, err := repoOne.ReadOperation(ctx, failKey, updatedHold.id, event.id)
+				_, err := repo.ReadOperation(ctx, failKey, updatedHold.id, event.id)
 				assert.ErrorIs(t, err, pgx.ErrNoRows)
 			}
 		})
@@ -720,7 +756,7 @@ func TestRepository(t *testing.T) {
 		assert.Equal(t, updatedHold, retriedHold)
 
 		var operationCount int
-		err = newRepo.conn.QueryRow(newRepoCtx,
+		err = newRepo.pool.QueryRow(newRepoCtx,
 			"SELECT COUNT(*) FROM operations").Scan(&operationCount)
 		assert.NoError(t, err)
 		assert.Equal(t, 1, operationCount)
