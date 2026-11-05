@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -596,7 +597,7 @@ func TestConfirmHoldHandler(t *testing.T) {
 }
 
 func TestConfirmHoldHandlerConcurrent(t *testing.T) {
-	t.Run("confirm two concurrent hold requests", func(t *testing.T) {
+	t.Run("confirm two concurrent memory hold requests", func(t *testing.T) {
 		responseChan := make(chan *httptest.ResponseRecorder)
 		clock := MockClock{
 			StaticTime: now,
@@ -676,5 +677,158 @@ func TestConfirmHoldHandlerConcurrent(t *testing.T) {
 		if slices.Contains(event.expirableHolds, storedHold.id) {
 			t.Errorf("expected expirable holds to not contain hold, but contains %v", event.expirableHolds)
 		}
+	})
+
+	t.Run("confirm two concurrent repository hold requests", func(t *testing.T) {
+		responseChan := make(chan *httptest.ResponseRecorder, 2)
+		eventChan := make(chan AcquireEvent, 2)
+		now := time.Now().Truncate(time.Microsecond)
+		deadline := now.Add(time.Minute * 30)
+		clock := MockClock{
+			StaticTime: now,
+		}
+		event := &Event{
+			id:                 "1",
+			capacity:           2,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		}
+		hold := Hold{
+			id:       "1",
+			status:   HoldStatusActive,
+			quantity: 1,
+			deadline: deadline,
+		}
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*30))
+		defer cancel()
+		connStr, _ := setupContainer(t, ctx)
+		repo := setupRepositoryWithObserver(t, ctx, connStr, eventChan)
+		_, err := repo.CreateEvent(ctx, event)
+		require.NoError(t, err)
+		_, err = repo.CreateHold(ctx, hold, event.id)
+		require.NoError(t, err)
+		server, err := initServer(&clock, repo)
+		require.NoError(t, err)
+
+		mux := http.NewServeMux()
+		mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
+
+		tx, err := repo.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		err = tx.QueryRow(ctx,
+			"SELECT id FROM events WHERE id = $1 FOR UPDATE",
+			event.id).Scan(nil)
+		require.NoError(t, err)
+
+		aCtx := context.WithValue(ctx, workerKey, "A")
+		bCtx := context.WithValue(ctx, workerKey, "B")
+
+		for i := range 2 {
+			var ctx context.Context
+			if i == 1 {
+				ctx = aCtx
+			} else {
+				ctx = bCtx
+			}
+			go func() {
+				req := httptest.NewRequest(http.MethodPost, "/events/1/holds/1/confirm", nil)
+				req = req.WithContext(ctx)
+				req.Header.Set("operation-key", "1")
+				rr := httptest.NewRecorder()
+				mux.ServeHTTP(rr, req)
+				responseChan <- rr
+			}()
+		}
+
+		var pidOne uint32
+		var pidTwo uint32
+		for range 2 {
+			select {
+			case data := <-eventChan:
+				require.NoError(t, data.Err)
+				switch data.Worker {
+				case "A":
+					if pidOne != 0 {
+						require.Fail(t, "received duplicate worker A")
+					}
+					pidOne = data.PID
+				case "B":
+					if pidTwo != 0 {
+						require.Fail(t, "received duplicate worker B")
+					}
+					pidTwo = data.PID
+				default:
+					require.Fail(t, "unknown worker label")
+				}
+			case <-ctx.Done():
+				require.Fail(t, "listening for events timed out")
+
+			}
+		}
+
+		if pidOne == 0 {
+			require.Fail(t, "pidOne is 0")
+		}
+		if pidTwo == 0 {
+			require.Fail(t, "pidTwo is 0")
+		}
+		if pidOne == pidTwo {
+			require.Fail(t, "pidOne matches pidTwo")
+		}
+
+		ticker := time.NewTicker(time.Millisecond * 10)
+		defer ticker.Stop()
+		for range ticker.C {
+			var blockingPidsOne []int64
+			var blockingPidsTwo []int64
+			err = tx.QueryRow(ctx, "SELECT pg_blocking_pids($1)", pidOne).Scan(&blockingPidsOne)
+			require.NoError(t, err)
+			err = tx.QueryRow(ctx, "SELECT pg_blocking_pids($1)", pidTwo).Scan(&blockingPidsTwo)
+			require.NoError(t, err)
+			if len(blockingPidsOne) != 0 && len(blockingPidsTwo) != 0 {
+				break
+			}
+		}
+		err = tx.Rollback(ctx)
+		require.NoError(t, err)
+
+		for range 2 {
+			select {
+			case rr := <-responseChan:
+				var body SuccessResponse
+				err = json.NewDecoder(rr.Body).Decode(&body)
+				require.NoError(t, err)
+				status := rr.Code
+				contentTypeHeader := rr.Header().Get("Content-Type")
+				assert.Equal(t, http.StatusOK, status)
+				assert.Equal(t, "application/json; charset=utf-8", contentTypeHeader)
+
+				assert.Equal(t, hold.id, body.Hold.ID)
+				assert.Equal(t, "confirmed", body.Hold.Status)
+				assert.Equal(t, hold.quantity, body.Hold.Quantity)
+				assert.Equal(t, hold.deadline, body.Hold.Deadline)
+			case <-aCtx.Done():
+				require.Fail(t, "waiting for request responses timed out")
+			}
+		}
+
+		storedHold, err := repo.ReadHold(ctx, hold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, hold.id, storedHold.id)
+		assert.Equal(t, HoldStatusConfirmed, storedHold.status)
+		assert.Equal(t, hold.quantity, storedHold.quantity)
+		assert.Equal(t, hold.deadline, storedHold.deadline)
+
+		operation, err := repo.ReadOperation(ctx, "1", storedHold.id, event.id)
+		assert.NoError(t, err)
+		assert.Equal(t, storedHold, operation)
+
+		var operationCount int
+		err = repo.pool.QueryRow(ctx,
+			"SELECT COUNT(*) FROM operations").Scan(&operationCount)
+		assert.NoError(t, err)
+		assert.Equal(t, 1, operationCount)
 	})
 }
