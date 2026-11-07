@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -830,5 +831,82 @@ func TestConfirmHoldHandlerConcurrent(t *testing.T) {
 			"SELECT COUNT(*) FROM operations").Scan(&operationCount)
 		assert.NoError(t, err)
 		assert.Equal(t, 1, operationCount)
+	})
+
+	t.Run("postgres deadline rejection", func(t *testing.T) {
+		now := time.Now().Truncate(time.Microsecond)
+		deadlineTests := []struct {
+			name        string
+			currentTime time.Time
+			deadline    time.Time
+		}{
+			{"hold deadline", now.Add(time.Minute * 30), now.Add(time.Minute * 30)},
+			{"after hold deadline", now.Add(time.Minute * 31), now.Add(time.Minute * 30)},
+			{"event cutoff", now.Add(time.Hour * 2), now.Add(time.Hour * 2).Add(time.Minute)},
+			{"after event cutoff", now.Add(time.Hour * 2).Add(time.Second), now.Add(time.Hour * 2).Add(time.Minute)},
+		}
+
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*5))
+		defer cancel()
+		event := &Event{
+			id:                 "1",
+			capacity:           4,
+			onsaleOpening:      now.Add(time.Minute),
+			holdCreationCutoff: now.Add(time.Hour),
+			confirmationCutoff: now.Add(time.Hour * 2),
+		}
+		repo, _ := setupTestcontainer(t, ctx)
+		_, err := repo.CreateEvent(ctx, event)
+		require.NoError(t, err)
+		for i, tt := range deadlineTests {
+			holdId := strconv.Itoa(i)
+			t.Run(tt.name, func(t *testing.T) {
+				clock := MockClock{
+					StaticTime: tt.currentTime,
+				}
+				hold := Hold{
+					id:       holdId,
+					status:   HoldStatusActive,
+					quantity: 1,
+					deadline: tt.deadline,
+				}
+				_, err = repo.CreateHold(ctx, hold, event.id)
+				require.NoError(t, err)
+				server, err := initServer(&clock, repo)
+				require.NoError(t, err)
+
+				mux := http.NewServeMux()
+				mux.HandleFunc("/events/{eventId}/holds/{holdId}/confirm", server.ConfirmHoldHandler)
+				req := httptest.NewRequest(http.MethodPost, "/events/1/holds/"+holdId+"/confirm", nil)
+				req.Header.Set("operation-key", "1")
+				rr := httptest.NewRecorder()
+				mux.ServeHTTP(rr, req)
+				var body ErrorResponse
+				decoder := json.NewDecoder(rr.Body)
+				err = decoder.Decode(&body)
+				assert.NoError(t, err)
+				err = decoder.Decode(&body)
+				assert.Equal(t, err, io.EOF)
+				status := rr.Code
+				contentTypeHeader := rr.Header().Get("Content-Type")
+				assert.Equal(t, http.StatusConflict, status)
+				assert.Equal(t, "application/json; charset=utf-8", contentTypeHeader)
+				assert.Equal(t, "can only transition hold before confirmation deadline", body.Message)
+				assert.Equal(t, "after_confirmation_deadline", body.Code)
+
+				storedHold, err := repo.ReadHold(ctx, hold.id, event.id)
+				assert.NoError(t, err)
+				assert.Equal(t, hold.id, storedHold.id)
+				assert.Equal(t, HoldStatusExpired, storedHold.status)
+				assert.Equal(t, hold.quantity, storedHold.quantity)
+				assert.Equal(t, hold.deadline, storedHold.deadline)
+
+				var operationCount int
+				err = repo.pool.QueryRow(ctx,
+					"SELECT COUNT(*) FROM operations").Scan(&operationCount)
+				assert.NoError(t, err)
+				assert.Equal(t, 0, operationCount)
+			})
+		}
 	})
 }

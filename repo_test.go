@@ -582,7 +582,6 @@ func TestRepository(t *testing.T) {
 					}
 				case <-ctx.Done():
 					require.Fail(t, "listening for events timed out")
-
 				}
 			}
 
